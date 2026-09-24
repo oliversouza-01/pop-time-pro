@@ -1,0 +1,3078 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pop Time Pro - Gestão de Equipamentos e Efluentes</title>
+<!-- Tailwind CSS -->
+<script src="https://cdn.tailwindcss.com"></script>
+<!-- Google Fonts Inter & JetBrains Mono -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">
+<!-- FontAwesome Icons -->
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+<!-- React & ReactDOM -->
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<!-- Babel Standalone -->
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<!-- HTML5 QR Code Reader Library (fallback) -->
+<script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+<!-- jsQR — decodificação de QR nativa no canvas (mais estável em mobile) -->
+<script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
+<!-- sql.js (SQLite no navegador via WebAssembly) -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/sql-wasm.js"></script>
+<meta http-equiv="Permissions-Policy" content="camera=(self)" />
+<style>
+body {
+font-family: 'Inter', sans-serif;
+background-color: #0f172a;
+color: #f8fafc;
+}
+.font-mono-code {
+font-family: 'JetBrains Mono', monospace;
+}
+[id^="qr-reader-"],
+[id^="reader-container-ind"] {
+min-height: 280px;
+width: 100%;
+}
+[id^="qr-reader-"] video,
+[id^="reader-container-ind"] video {
+width: 100% !important;
+max-height: 360px;
+object-fit: cover;
+border-radius: 12px;
+}
+[id^="qr-reader-"] img,
+[id^="reader-container-ind"] img {
+display: none !important;
+}
+/* Formatação de Impressão de Etiquetas Térmicas/Industriais */
+@media print {
+body * {
+visibility: hidden !important;
+}
+#printable-label-area, #printable-label-area * {
+visibility: visible !important;
+}
+#printable-label-area {
+position: absolute !important;
+left: 0 !important;
+top: 0 !important;
+width: 100% !important;
+margin: 0 !important;
+padding: 0 !important;
+background: #fff !important;
+color: #000 !important;
+}
+.no-print {
+display: none !important;
+}
+.page-break {
+page-break-after: always;
+break-after: page;
+}
+@page {
+size: auto;
+margin: 2mm;
+}
+}
+::-webkit-scrollbar {
+width: 6px;
+height: 6px;
+}
+::-webkit-scrollbar-track {
+background: #1e293b;
+}
+::-webkit-scrollbar-thumb {
+background: #475569;
+border-radius: 4px;
+}
+</style>
+</head>
+<body class="bg-slate-950 min-h-screen text-slate-100 antialiased selection:bg-cyan-500 selection:text-slate-950">
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef } = React;
+
+const SAMPLE_CATEGORIES = ['Reativos & Químicos', 'Bombas & Dosadores', 'Instrumentação & Sensores', 'Filtros & Membranas', 'EPIs & Segurança'];
+const SAMPLE_SECTORS = ['ETE - Tanque de Neutralização', 'ETE - Decantador Primário', 'ETA - Estação de Água', 'Laboratório de Análises', 'Almoxarifado Central'];
+
+/* ============================================================
+   SQLite (sql.js) + IndexedDB — persistência local robusta
+   ============================================================ */
+const IDB_NAME = 'PopTimeProSQLite';
+const IDB_STORE = 'sqlite';
+const IDB_KEY = 'db';
+
+let _sqlDb = null;
+let _SQL = null;
+let _dbReady = false;
+let _saveTimer = null;
+
+function idbOpen() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(IDB_NAME, 1);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(IDB_STORE)) {
+        db.createObjectStore(IDB_STORE);
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function idbLoad() {
+  try {
+    const db = await idbOpen();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_STORE, 'readonly');
+      const store = tx.objectStore(IDB_STORE);
+      const req = store.get(IDB_KEY);
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror = () => reject(req.error);
+    });
+  } catch (e) {
+    console.warn('IndexedDB load falhou:', e);
+    return null;
+  }
+}
+
+async function idbSave(uint8) {
+  try {
+    const db = await idbOpen();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_STORE, 'readwrite');
+      const store = tx.objectStore(IDB_STORE);
+      const req = store.put(uint8, IDB_KEY);
+      req.onsuccess = () => resolve();
+      req.onerror = () => reject(req.error);
+    });
+  } catch (e) {
+    console.warn('IndexedDB save falhou:', e);
+  }
+}
+
+function createSchema(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS settings (
+      key TEXT PRIMARY KEY,
+      value TEXT
+    );
+    CREATE TABLE IF NOT EXISTS categories (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT UNIQUE NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS sectors (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT UNIQUE NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS stock_items (
+      id TEXT PRIMARY KEY,
+      data TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS history_logs (
+      id TEXT PRIMARY KEY,
+      data TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS non_conformities (
+      id TEXT PRIMARY KEY,
+      data TEXT NOT NULL
+    );
+  `);
+}
+
+function persistDbSoon() {
+  if (!_sqlDb) return;
+  clearTimeout(_saveTimer);
+  _saveTimer = setTimeout(async () => {
+    try {
+      const data = _sqlDb.export();
+      await idbSave(data);
+    } catch (e) {
+      console.error('Erro ao persistir SQLite:', e);
+    }
+  }, 400);
+}
+
+async function initSqlite() {
+  if (_dbReady && _sqlDb) return _sqlDb;
+  try {
+    _SQL = await initSqlJs({
+      locateFile: file => `https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/${file}`
+    });
+    const saved = await idbLoad();
+    if (saved && saved.length) {
+      _sqlDb = new _SQL.Database(new Uint8Array(saved));
+    } else {
+      _sqlDb = new _SQL.Database();
+      createSchema(_sqlDb);
+      // Migração automática do localStorage antigo (se existir)
+      migrateFromLocalStorage(_sqlDb);
+      persistDbSoon();
+    }
+    createSchema(_sqlDb); // garante schema mesmo em DBs antigos
+    _dbReady = true;
+    return _sqlDb;
+  } catch (e) {
+    console.error('Falha ao iniciar SQLite:', e);
+    // Fallback em memória
+    if (_SQL) {
+      _sqlDb = new _SQL.Database();
+      createSchema(_sqlDb);
+      _dbReady = true;
+    }
+    return _sqlDb;
+  }
+}
+
+function migrateFromLocalStorage(db) {
+  try {
+    const cats = localStorage.getItem('poptime_ind_categories');
+    const secs = localStorage.getItem('poptime_ind_sectors');
+    const stock = localStorage.getItem('poptime_ind_stock');
+    const hist = localStorage.getItem('poptime_ind_history');
+    const nc = localStorage.getItem('poptime_ind_nonconform');
+    const admin = localStorage.getItem('poptime_ind_admin_name');
+    const company = localStorage.getItem('poptime_ind_company_name');
+
+    if (admin) db.run('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', ['adminName', admin]);
+    if (company) db.run('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', ['companyName', company]);
+
+    if (cats) {
+      const arr = JSON.parse(cats);
+      arr.forEach(name => {
+        try { db.run('INSERT OR IGNORE INTO categories (name) VALUES (?)', [name]); } catch (_) {}
+      });
+    }
+    if (secs) {
+      const arr = JSON.parse(secs);
+      arr.forEach(name => {
+        try { db.run('INSERT OR IGNORE INTO sectors (name) VALUES (?)', [name]); } catch (_) {}
+      });
+    }
+    if (stock) {
+      const arr = JSON.parse(stock);
+      arr.forEach(item => {
+        try { db.run('INSERT OR REPLACE INTO stock_items (id, data) VALUES (?, ?)', [item.id, JSON.stringify(item)]); } catch (_) {}
+      });
+    }
+    if (hist) {
+      const arr = JSON.parse(hist);
+      arr.forEach(log => {
+        try { db.run('INSERT OR REPLACE INTO history_logs (id, data) VALUES (?, ?)', [log.id, JSON.stringify(log)]); } catch (_) {}
+      });
+    }
+    if (nc) {
+      const arr = JSON.parse(nc);
+      arr.forEach(n => {
+        try { db.run('INSERT OR REPLACE INTO non_conformities (id, data) VALUES (?, ?)', [n.id, JSON.stringify(n)]); } catch (_) {}
+      });
+    }
+  } catch (e) {
+    console.warn('Migração localStorage → SQLite falhou (ignorado):', e);
+  }
+}
+
+function sqliteGetSetting(key, fallback = '') {
+  if (!_sqlDb) return fallback;
+  try {
+    const stmt = _sqlDb.prepare('SELECT value FROM settings WHERE key = ?');
+    stmt.bind([key]);
+    if (stmt.step()) {
+      const row = stmt.getAsObject();
+      stmt.free();
+      return row.value != null ? row.value : fallback;
+    }
+    stmt.free();
+  } catch (_) {}
+  return fallback;
+}
+
+function sqliteSetSetting(key, value) {
+  if (!_sqlDb) return;
+  _sqlDb.run('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', [key, value]);
+  persistDbSoon();
+}
+
+function sqliteLoadList(table) {
+  if (!_sqlDb) return [];
+  try {
+    const res = _sqlDb.exec(`SELECT data FROM ${table}`);
+    if (!res.length) return [];
+    const items = res[0].values.map(row => JSON.parse(row[0]));
+    // Histórico e NC: mais recentes primeiro
+    if (table === 'history_logs' || table === 'non_conformities') {
+      items.sort((a, b) => new Date(b.timestamp || 0) - new Date(a.timestamp || 0));
+    }
+    return items;
+  } catch (_) {
+    return [];
+  }
+}
+
+function sqliteSaveList(table, items) {
+  if (!_sqlDb) return;
+  _sqlDb.run(`DELETE FROM ${table}`);
+  const stmt = _sqlDb.prepare(`INSERT INTO ${table} (id, data) VALUES (?, ?)`);
+  items.forEach(item => {
+    stmt.run([item.id, JSON.stringify(item)]);
+  });
+  stmt.free();
+  persistDbSoon();
+}
+
+function sqliteLoadNames(table) {
+  if (!_sqlDb) return [];
+  try {
+    const res = _sqlDb.exec(`SELECT name FROM ${table} ORDER BY id`);
+    if (!res.length) return [];
+    return res[0].values.map(r => r[0]);
+  } catch (_) {
+    return [];
+  }
+}
+
+function sqliteSaveNames(table, names) {
+  if (!_sqlDb) return;
+  _sqlDb.run(`DELETE FROM ${table}`);
+  const stmt = _sqlDb.prepare(`INSERT INTO ${table} (name) VALUES (?)`);
+  names.forEach(n => stmt.run([n]));
+  stmt.free();
+  persistDbSoon();
+}
+
+function sqliteClearAll() {
+  if (!_sqlDb) return;
+  ['settings', 'categories', 'sectors', 'stock_items', 'history_logs', 'non_conformities'].forEach(t => {
+    try { _sqlDb.run(`DELETE FROM ${t}`); } catch (_) {}
+  });
+  persistDbSoon();
+}
+
+function formatDateTime(isoString) {
+if (!isoString) return '--/--/---- --:--';
+const date = new Date(isoString);
+if (isNaN(date.getTime())) return '--/--/---- --:--';
+return date.toLocaleString('pt-BR', {
+day: '2-digit',
+month: '2-digit',
+year: 'numeric',
+hour: '2-digit',
+minute: '2-digit'
+});
+}
+
+function formatDateShort(isoString) {
+if (!isoString) return '';
+const date = new Date(isoString);
+if (isNaN(date.getTime())) return '';
+return date.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit', year: '2-digit' });
+}
+
+function getItemStatus(validityIso, quantity = 1, minQuantity = 0) {
+if (quantity <= 0) {
+return { code: 'EXHAUSTED', label: 'SEM ESTOQUE (ZERADO)', color: 'bg-slate-700 text-slate-300 border-slate-600' };
+}
+if (!validityIso) return { code: 'VALID', label: 'OPERACIONAL', color: 'bg-emerald-600 text-white' };
+const now = new Date();
+const valDate = new Date(validityIso);
+const diffHours = (valDate - now) / (1000 * 60 * 60);
+if (diffHours < 0) {
+return { code: 'EXPIRED', label: 'REVISÃO / VALIDADE VENCIDA', color: 'bg-red-600 text-white border-red-700' };
+} else if (diffHours <= 72) {
+return { code: 'URGENT', label: 'PRÓXIMO DO PRAZO (≤ 72h)', color: 'bg-amber-500 text-slate-950 border-amber-600 font-bold' };
+} else if (minQuantity > 0 && quantity <= minQuantity) {
+return { code: 'LOW_STOCK', label: 'ESTOQUE CRÍTICO (≤ MÍNIMO)', color: 'bg-orange-600 text-white border-orange-700 font-bold' };
+} else {
+return { code: 'VALID', label: 'EM CONFORMIDADE', color: 'bg-emerald-600 text-white border-emerald-700' };
+}
+}
+
+function getQrCodeUrl(dataString) {
+return `https://api.qrserver.com/v1/create-qr-code/?size=180x180&data=${encodeURIComponent(dataString)}`;
+}
+
+function App() {
+const [activeTab, setActiveTab] = useState('dashboard');
+const [dbReady, setDbReady] = useState(false);
+const [categories, setCategories] = useState(SAMPLE_CATEGORIES);
+const [sectors, setSectors] = useState(SAMPLE_SECTORS);
+const [stockItems, setStockItems] = useState([]);
+const [historyLogs, setHistoryLogs] = useState([]);
+const [nonConformities, setNonConformities] = useState([]);
+const [adminName, setAdminName] = useState('Eng. Supervisora');
+const [companyName, setCompanyName] = useState('Tratamento de Efluentes & Qualidade');
+const skipFirstSave = useRef(true);
+
+// Formulário de Cadastro
+const [productName, setProductName] = useState('');
+const [selectedCategory, setSelectedCategory] = useState('');
+const [selectedSector, setSelectedSector] = useState('');
+const [serialOrTag, setSerialOrTag] = useState('');
+const getNowIsoLocal = () => {
+const now = new Date();
+now.setMinutes(now.getMinutes() - now.getTimezoneOffset());
+return now.toISOString().slice(0, 16);
+};
+const [creationDate, setCreationDate] = useState(getNowIsoLocal);
+const [validityValue, setValidityValue] = useState(30);
+const [validityUnit, setValidityUnit] = useState('days');
+const [calculatedValidity, setCalculatedValidity] = useState(() => {
+const d = new Date();
+d.setDate(d.getDate() + 30);
+d.setMinutes(d.getMinutes() - d.getTimezoneOffset());
+return d.toISOString().slice(0, 16);
+});
+const [operatorName, setOperatorName] = useState('');
+const [batchNumber, setBatchNumber] = useState('');
+const [quantity, setQuantity] = useState(1);
+const [minQuantity, setMinQuantity] = useState(1);
+const [technicalNotes, setTechnicalNotes] = useState('');
+
+// Modais e Pesquisa
+const [modalMessage, setModalMessage] = useState(null);
+const [scannedResult, setScannedResult] = useState(null);
+const [manualSearchId, setManualSearchId] = useState('');
+const [printBatchItems, setPrintBatchItems] = useState([]);
+
+// Filtros Avançados - Estoque
+const [stockSearch, setStockSearch] = useState('');
+const [stockCategoryFilter, setStockCategoryFilter] = useState('');
+const [stockSectorFilter, setStockSectorFilter] = useState('');
+const [stockStatusFilter, setStockStatusFilter] = useState('ALL');
+const [showExhausted, setShowExhausted] = useState(false);
+
+// Filtros Avançados - Histórico
+const [historySearch, setHistorySearch] = useState('');
+const [historyTypeFilter, setHistoryTypeFilter] = useState('ALL');
+const [historyDateStart, setHistoryDateStart] = useState('');
+const [historyDateEnd, setHistoryDateEnd] = useState('');
+
+// Modal de Movimentação (ENTRADA / SAÍDA)
+const [actionModalItem, setActionModalItem] = useState(null);
+const [movementType, setMovementType] = useState('SAIDA');
+const [movementQty, setMovementQty] = useState(1);
+const [actionNotes, setActionNotes] = useState('');
+
+// Modal de Edição Completa de Item
+const [editModalItem, setEditModalItem] = useState(null);
+const [editForm, setEditForm] = useState({
+productName: '',
+category: '',
+sector: '',
+serialOrTag: '',
+batchNumber: '',
+operator: '',
+technicalNotes: '',
+quantity: 1,
+minQuantity: 1,
+validityDate: ''
+});
+
+// Modal de Confirmação de Exclusão
+const [itemToDelete, setItemToDelete] = useState(null);
+const [confirmResetModal, setConfirmResetModal] = useState(false);
+
+// Não Conformidade form
+const [ncItemId, setNcItemId] = useState('');
+const [ncPhase, setNcPhase] = useState('ANTES');
+const [ncDescription, setNcDescription] = useState('');
+const [ncSeverity, setNcSeverity] = useState('MEDIA');
+const [ncOperator, setNcOperator] = useState('');
+const [ncSearch, setNcSearch] = useState('');
+const [ncPhaseFilter, setNcPhaseFilter] = useState('ALL');
+
+// Inicialização SQLite (carrega dados + migra localStorage se necessário)
+useEffect(() => {
+  let cancelled = false;
+  (async () => {
+    await initSqlite();
+    if (cancelled) return;
+    const cats = sqliteLoadNames('categories');
+    const secs = sqliteLoadNames('sectors');
+    const stock = sqliteLoadList('stock_items');
+    const hist = sqliteLoadList('history_logs');
+    const ncs = sqliteLoadList('non_conformities');
+    const adm = sqliteGetSetting('adminName', 'Eng. Supervisora');
+    const comp = sqliteGetSetting('companyName', 'Tratamento de Efluentes & Qualidade');
+    if (cats.length) setCategories(cats);
+    else {
+      sqliteSaveNames('categories', SAMPLE_CATEGORIES);
+      setCategories(SAMPLE_CATEGORIES);
+    }
+    if (secs.length) setSectors(secs);
+    else {
+      sqliteSaveNames('sectors', SAMPLE_SECTORS);
+      setSectors(SAMPLE_SECTORS);
+    }
+    setStockItems(stock);
+    setHistoryLogs(hist);
+    setNonConformities(ncs);
+    setAdminName(adm);
+    setCompanyName(comp);
+    setDbReady(true);
+    // permite saves após o primeiro ciclo de render
+    setTimeout(() => { skipFirstSave.current = false; }, 600);
+  })();
+  return () => { cancelled = true; };
+}, []);
+
+// Persistência SQLite (debounced via persistDbSoon)
+useEffect(() => {
+  if (!dbReady || skipFirstSave.current) return;
+  sqliteSaveNames('categories', categories);
+}, [categories, dbReady]);
+useEffect(() => {
+  if (!dbReady || skipFirstSave.current) return;
+  sqliteSaveNames('sectors', sectors);
+}, [sectors, dbReady]);
+useEffect(() => {
+  if (!dbReady || skipFirstSave.current) return;
+  sqliteSaveList('stock_items', stockItems);
+}, [stockItems, dbReady]);
+useEffect(() => {
+  if (!dbReady || skipFirstSave.current) return;
+  sqliteSaveList('history_logs', historyLogs);
+}, [historyLogs, dbReady]);
+useEffect(() => {
+  if (!dbReady || skipFirstSave.current) return;
+  sqliteSaveList('non_conformities', nonConformities);
+}, [nonConformities, dbReady]);
+useEffect(() => {
+  if (!dbReady || skipFirstSave.current) return;
+  sqliteSetSetting('adminName', adminName);
+}, [adminName, dbReady]);
+useEffect(() => {
+  if (!dbReady || skipFirstSave.current) return;
+  sqliteSetSetting('companyName', companyName);
+}, [companyName, dbReady]);
+
+useEffect(() => {
+if (!creationDate) return;
+const manip = new Date(creationDate);
+if (isNaN(manip.getTime())) return;
+const valDate = new Date(manip);
+const qtyValue = parseFloat(validityValue || 0);
+if (!isNaN(qtyValue)) {
+if (validityUnit === 'hours') {
+valDate.setHours(valDate.getHours() + qtyValue);
+} else if (validityUnit === 'days') {
+valDate.setDate(valDate.getDate() + qtyValue);
+} else if (validityUnit === 'months') {
+valDate.setMonth(valDate.getMonth() + qtyValue);
+}
+valDate.setMinutes(valDate.getMinutes() - valDate.getTimezoneOffset());
+setCalculatedValidity(valDate.toISOString().slice(0, 16));
+}
+}, [creationDate, validityValue, validityUnit]);
+
+const addHistoryLog = (type, itemData, details = '', movementAmount = 0) => {
+const newLog = {
+id: 'LOG-' + Date.now() + '-' + Math.random().toString(36).substr(2, 4),
+timestamp: new Date().toISOString(),
+type,
+productName: itemData.productName,
+labelId: itemData.id,
+operator: itemData.operator || adminName,
+category: itemData.category || 'Geral',
+sector: itemData.sector || 'Não informado',
+movementAmount,
+details
+};
+setHistoryLogs(prev => [newLog, ...prev]);
+};
+
+const loadSampleData = () => {
+const now = new Date();
+const sampleItems = [
+{
+id: 'TAG-POLIMERO-01',
+productName: 'Polímero Aniónico AnionFlok',
+category: 'Reativos & Químicos',
+sector: 'ETE - Tanque de Neutralização',
+serialOrTag: 'POL-2026-A1',
+creationDate: new Date(now.getTime() - 5 * 86400000).toISOString(),
+validityDate: new Date(now.getTime() + 2 * 86400000).toISOString(),
+operator: adminName,
+batchNumber: 'LT-AN882',
+technicalNotes: 'Dosagem max 15ppm. Manter fechado.',
+quantity: 3,
+minQuantity: 5,
+status: 'ACTIVE'
+},
+{
+id: 'TAG-BOMBA-DOS-02',
+productName: 'Bomba Dosadora de Cloro 12L/h',
+category: 'Bombas & Dosadores',
+sector: 'ETA - Estação de Água',
+serialOrTag: 'BMB-DOS-902',
+creationDate: new Date(now.getTime() - 40 * 86400000).toISOString(),
+validityDate: new Date(now.getTime() - 2 * 86400000).toISOString(),
+operator: adminName,
+batchNumber: 'EQ-2025-X',
+technicalNotes: 'Necessita recalibração do diafragma.',
+quantity: 1,
+minQuantity: 1,
+status: 'ACTIVE'
+},
+{
+id: 'TAG-PH-METRO-03',
+productName: 'Eletrodo Sensor de pH Industrial',
+category: 'Instrumentação & Sensores',
+sector: 'Laboratório de Análises',
+serialOrTag: 'PH-SENS-441',
+creationDate: new Date(now.getTime() - 10 * 86400000).toISOString(),
+validityDate: new Date(now.getTime() + 60 * 86400000).toISOString(),
+operator: 'Téc. Roberto',
+batchNumber: 'LT-PH74',
+technicalNotes: 'Calibrado com soluções tampão pH 4 e 7.',
+quantity: 4,
+minQuantity: 2,
+status: 'ACTIVE'
+}
+];
+setStockItems(sampleItems);
+setModalMessage({
+type: 'success',
+title: 'Dados de Exemplo Carregados',
+text: '3 itens de demonstração foram inseridos com sucesso no estoque!'
+});
+};
+
+const handleCreateLabel = (shouldPrintDirectly = false) => {
+if (!productName.trim()) {
+setModalMessage({ type: 'error', title: 'Campo Obrigatório', text: 'Por favor, informe a descrição do equipamento ou insumo.' });
+return;
+}
+const createIso = new Date(creationDate).toISOString();
+const valIso = new Date(calculatedValidity).toISOString();
+const initialQty = Math.max(1, parseInt(quantity) || 1);
+const minQty = Math.max(0, parseInt(minQuantity) || 0);
+const newItem = {
+id: 'TAG-' + Date.now().toString(36).toUpperCase() + '-' + Math.floor(Math.random() * 899 + 100),
+productName: productName.trim(),
+category: selectedCategory.trim() || 'Geral',
+sector: selectedSector.trim() || 'Estação Principal',
+serialOrTag: serialOrTag.trim() || 'N/A',
+creationDate: createIso,
+validityDate: valIso,
+operator: operatorName.trim() || adminName,
+batchNumber: batchNumber.trim() || 'LT-' + formatDateShort(createIso).replace(/\//g, ''),
+technicalNotes: technicalNotes.trim(),
+quantity: initialQty,
+minQuantity: minQty,
+initialQuantity: initialQty,
+status: 'ACTIVE',
+createdAt: new Date().toISOString()
+};
+setStockItems(prev => [newItem, ...prev]);
+addHistoryLog('ENTRADA', newItem, `Cadastro inicial. Qtd: ${initialQty} un. Mínimo: ${minQty} un. Setor: ${newItem.sector}`, initialQty);
+setPrintBatchItems([newItem]);
+setModalMessage({
+type: 'success',
+title: 'Entrada Registrada com Sucesso!',
+text: `Item "${newItem.productName}" cadastrado (${initialQty} unidades).`
+});
+if (shouldPrintDirectly) {
+setTimeout(() => { window.print(); }, 400);
+}
+};
+
+const handleOpenEditModal = (item) => {
+let valDateString = '';
+if (item.validityDate) {
+const d = new Date(item.validityDate);
+d.setMinutes(d.getMinutes() - d.getTimezoneOffset());
+valDateString = d.toISOString().slice(0, 16);
+}
+setEditModalItem(item);
+setEditForm({
+productName: item.productName || '',
+category: item.category || 'Geral',
+sector: item.sector || 'Estação Principal',
+serialOrTag: item.serialOrTag || '',
+batchNumber: item.batchNumber || '',
+operator: item.operator || adminName,
+technicalNotes: item.technicalNotes || '',
+quantity: item.quantity !== undefined ? item.quantity : 1,
+minQuantity: item.minQuantity !== undefined ? item.minQuantity : 1,
+validityDate: valDateString
+});
+};
+
+const handleSaveEdit = () => {
+if (!editModalItem) return;
+if (!editForm.productName.trim()) {
+setModalMessage({ type: 'error', title: 'Atenção', text: 'O nome do equipamento não pode ser vazio.' });
+return;
+}
+const updatedQty = Math.max(0, parseInt(editForm.quantity) || 0);
+const updatedMinQty = Math.max(0, parseInt(editForm.minQuantity) || 0);
+const updatedValIso = editForm.validityDate ? new Date(editForm.validityDate).toISOString() : editModalItem.validityDate;
+const updatedItem = {
+...editModalItem,
+productName: editForm.productName.trim(),
+category: editForm.category.trim() || 'Geral',
+sector: editForm.sector.trim() || 'Estação Principal',
+serialOrTag: editForm.serialOrTag.trim() || 'N/A',
+batchNumber: editForm.batchNumber.trim() || 'N/A',
+operator: editForm.operator.trim() || adminName,
+technicalNotes: editForm.technicalNotes.trim(),
+quantity: updatedQty,
+minQuantity: updatedMinQty,
+validityDate: updatedValIso,
+lastEditedAt: new Date().toISOString()
+};
+setStockItems(prev => prev.map(item => item.id === editModalItem.id ? updatedItem : item));
+addHistoryLog('EDIÇÃO', updatedItem, `Dados alterados via edição direta. Saldo: ${updatedQty} un | Mín: ${updatedMinQty} un.`);
+setModalMessage({
+type: 'success',
+title: 'Cadastro Atualizado!',
+text: `Os dados de "${updatedItem.productName}" foram atualizados.`
+});
+setEditModalItem(null);
+setScannedResult(null);
+};
+
+const handleProcessAction = () => {
+if (!actionModalItem) return;
+const qtyMove = Math.max(1, parseInt(movementQty) || 1);
+let updatedItem = null;
+if (movementType === 'SAIDA') {
+const currentQty = parseInt(actionModalItem.quantity) || 0;
+const newQty = Math.max(0, currentQty - qtyMove);
+setStockItems(prev => prev.map(s => {
+if (s.id === actionModalItem.id) {
+updatedItem = {
+...s,
+quantity: newQty,
+status: newQty === 0 ? 'EXHAUSTED' : 'ACTIVE',
+lastActionAt: new Date().toISOString(),
+lastActionNotes: actionNotes
+};
+return updatedItem;
+}
+return s;
+}));
+addHistoryLog('SAÍDA', actionModalItem, `Saída de ${qtyMove} un. Saldo atual: ${newQty} un. Obs: ${actionNotes || 'Nenhuma'}`, -qtyMove);
+setModalMessage({
+type: 'info',
+title: 'Saída Registrada',
+text: `Baixa de ${qtyMove} un. para "${actionModalItem.productName}". Saldo atual: ${newQty}.`
+});
+} else if (movementType === 'ENTRADA') {
+const currentQty = parseInt(actionModalItem.quantity) || 0;
+const newQty = currentQty + qtyMove;
+setStockItems(prev => prev.map(s => {
+if (s.id === actionModalItem.id) {
+updatedItem = {
+...s,
+quantity: newQty,
+status: 'ACTIVE',
+lastActionAt: new Date().toISOString(),
+lastActionNotes: actionNotes
+};
+return updatedItem;
+}
+return s;
+}));
+addHistoryLog('ENTRADA', actionModalItem, `Entrada de ${qtyMove} un. Saldo total: ${newQty} un. Obs: ${actionNotes || 'Nenhuma'}`, qtyMove);
+setModalMessage({
+type: 'success',
+title: 'Entrada Adicionada',
+text: `Adicionadas ${qtyMove} un. ao estoque de "${actionModalItem.productName}". Novo saldo: ${newQty}.`
+});
+}
+setActionModalItem(null);
+setMovementQty(1);
+setActionNotes('');
+setScannedResult(null);
+};
+
+const handleConfirmAdminDelete = () => {
+if (!itemToDelete) return;
+setStockItems(prev => prev.filter(s => s.id !== itemToDelete.id));
+addHistoryLog('EXCLUSÃO ADM', itemToDelete, `Registro excluído. Qtd anterior: ${itemToDelete.quantity} un.`);
+setModalMessage({
+type: 'warning',
+title: 'Registro Excluído',
+text: `O registro "${itemToDelete.productName}" (${itemToDelete.id}) foi removido.`
+});
+setItemToDelete(null);
+setScannedResult(null);
+};
+
+const handleManualSearch = (e) => {
+e.preventDefault();
+if (!manualSearchId.trim()) return;
+const found = stockItems.find(s =>
+s.id.toLowerCase() === manualSearchId.trim().toLowerCase() ||
+(s.serialOrTag && s.serialOrTag.toLowerCase() === manualSearchId.trim().toLowerCase())
+);
+if (found) {
+setScannedResult(found);
+} else {
+setModalMessage({ type: 'error', title: 'Não Localizado', text: `Nenhum registro encontrado para "${manualSearchId}".` });
+}
+};
+
+const handleAddNonConformity = () => {
+if (!ncItemId.trim() || !ncDescription.trim()) {
+setModalMessage({ type: 'error', title: 'Campos Obrigatórios', text: 'Selecione o item e descreva a não conformidade.' });
+return;
+}
+const item = stockItems.find(s => s.id === ncItemId);
+if (!item) {
+setModalMessage({ type: 'error', title: 'Item não encontrado', text: 'O item selecionado não existe no estoque.' });
+return;
+}
+const newNc = {
+id: 'NC-' + Date.now().toString(36).toUpperCase(),
+itemId: item.id,
+productName: item.productName,
+serialOrTag: item.serialOrTag,
+phase: ncPhase,
+description: ncDescription.trim(),
+severity: ncSeverity,
+operator: ncOperator.trim() || adminName,
+timestamp: new Date().toISOString(),
+sector: item.sector,
+category: item.category
+};
+setNonConformities(prev => [newNc, ...prev]);
+addHistoryLog('NÃO CONFORMIDADE', item, `NC registrada (${ncPhase}): ${ncDescription.trim().substring(0, 80)}...`, 0);
+setModalMessage({
+type: 'success',
+title: 'Não Conformidade Registrada',
+text: `Registro de NC criado para "${item.productName}".`
+});
+setNcItemId('');
+setNcDescription('');
+setNcPhase('ANTES');
+setNcSeverity('MEDIA');
+setNcOperator('');
+};
+
+// Filtragem do Estoque
+const filteredStock = stockItems.filter(item => {
+const qty = item.quantity || 0;
+if (!showExhausted && qty <= 0) return false;
+if (stockSearch.trim()) {
+const term = stockSearch.toLowerCase().trim();
+const matchName = (item.productName || '').toLowerCase().includes(term);
+const matchTag = (item.serialOrTag || '').toLowerCase().includes(term);
+const matchBatch = (item.batchNumber || '').toLowerCase().includes(term);
+const matchId = (item.id || '').toLowerCase().includes(term);
+const matchCategory = (item.category || '').toLowerCase().includes(term);
+const matchSector = (item.sector || '').toLowerCase().includes(term);
+if (!matchName && !matchTag && !matchBatch && !matchId && !matchCategory && !matchSector) {
+return false;
+}
+}
+if (stockCategoryFilter && item.category !== stockCategoryFilter) return false;
+if (stockSectorFilter && item.sector !== stockSectorFilter) return false;
+if (stockStatusFilter !== 'ALL') {
+const statusObj = getItemStatus(item.validityDate, item.quantity, item.minQuantity || 0);
+if (stockStatusFilter === 'LOW_STOCK') {
+if (qty <= 0 || qty > (item.minQuantity || 0)) return false;
+} else if (statusObj.code !== stockStatusFilter) {
+return false;
+}
+}
+return true;
+});
+
+// Filtragem do Histórico
+const filteredHistory = historyLogs.filter(log => {
+if (historySearch.trim()) {
+const term = historySearch.toLowerCase().trim();
+const matchName = (log.productName || '').toLowerCase().includes(term);
+const matchId = (log.labelId || '').toLowerCase().includes(term);
+const matchOperator = (log.operator || '').toLowerCase().includes(term);
+const matchDetails = (log.details || '').toLowerCase().includes(term);
+if (!matchName && !matchId && !matchOperator && !matchDetails) return false;
+}
+if (historyTypeFilter !== 'ALL' && log.type !== historyTypeFilter) return false;
+if (historyDateStart) {
+const logTime = new Date(log.timestamp).getTime();
+const startTime = new Date(historyDateStart).getTime();
+if (logTime < startTime) return false;
+}
+if (historyDateEnd) {
+const logTime = new Date(log.timestamp).getTime();
+const endTime = new Date(historyDateEnd + 'T23:59:59').getTime();
+if (logTime > endTime) return false;
+}
+return true;
+});
+
+// Filtragem Não Conformidades
+const filteredNc = nonConformities.filter(nc => {
+if (ncSearch.trim()) {
+const term = ncSearch.toLowerCase().trim();
+const matchName = (nc.productName || '').toLowerCase().includes(term);
+const matchDesc = (nc.description || '').toLowerCase().includes(term);
+const matchTag = (nc.serialOrTag || '').toLowerCase().includes(term);
+if (!matchName && !matchDesc && !matchTag) return false;
+}
+if (ncPhaseFilter !== 'ALL' && nc.phase !== ncPhaseFilter) return false;
+return true;
+});
+
+const exportCSV = () => {
+if (stockItems.length === 0) {
+setModalMessage({ type: 'warning', title: 'Sem Dados', text: 'Não existem registros para exportar.' });
+return;
+}
+let csvContent = "data:text/csv;charset=utf-8,ID,Equipamento/Insumo,Categoria,Setor,Tag/Serie,Lote,Qtd Atual,Qtd Minima,Operador,Data Entrada,Validade/Verificacao,Status\n";
+stockItems.forEach(item => {
+csvContent += `"${item.id}","${item.productName}","${item.category}","${item.sector}","${item.serialOrTag}","${item.batchNumber}","${item.quantity || 0}","${item.minQuantity || 0}","${item.operator}","${formatDateTime(item.creationDate)}","${formatDateTime(item.validityDate)}","${item.status}"\n`;
+});
+const encodedUri = encodeURI(csvContent);
+const link = document.createElement("a");
+link.setAttribute("href", encodedUri);
+link.setAttribute("download", `poptime_relatorio_${new Date().toISOString().slice(0,10)}.csv`);
+document.body.appendChild(link);
+link.click();
+document.body.removeChild(link);
+};
+
+const exportBackupJSON = () => {
+const backupData = {
+categories,
+sectors,
+stockItems,
+historyLogs,
+nonConformities,
+adminName,
+companyName,
+exportDate: new Date().toISOString()
+};
+const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(backupData, null, 2));
+const downloadAnchor = document.createElement('a');
+downloadAnchor.setAttribute("href", dataStr);
+downloadAnchor.setAttribute("download", `poptime_backup_${new Date().toISOString().slice(0,10)}.json`);
+document.body.appendChild(downloadAnchor);
+downloadAnchor.click();
+downloadAnchor.remove();
+};
+
+const importBackupJSON = (event) => {
+const fileReader = new FileReader();
+if (event.target.files && event.target.files[0]) {
+fileReader.readAsText(event.target.files[0], "UTF-8");
+fileReader.onload = (e) => {
+try {
+const parsed = JSON.parse(e.target.result);
+if (parsed.stockItems) setStockItems(parsed.stockItems);
+if (parsed.categories) setCategories(parsed.categories);
+if (parsed.sectors) setSectors(parsed.sectors);
+if (parsed.historyLogs) setHistoryLogs(parsed.historyLogs);
+if (parsed.nonConformities) setNonConformities(parsed.nonConformities);
+if (parsed.adminName) setAdminName(parsed.adminName);
+if (parsed.companyName) setCompanyName(parsed.companyName);
+setModalMessage({ type: 'success', title: 'Restauração Concluída', text: 'Seus dados foram importados com sucesso!' });
+} catch (err) {
+setModalMessage({ type: 'error', title: 'Arquivo Inválido', text: 'O arquivo JSON selecionado não é compatível.' });
+}
+};
+}
+};
+
+const activeStock = stockItems.filter(i => (i.quantity || 0) > 0);
+const expiredCount = activeStock.filter(i => getItemStatus(i.validityDate, i.quantity, i.minQuantity).code === 'EXPIRED').length;
+const urgentCount = activeStock.filter(i => getItemStatus(i.validityDate, i.quantity, i.minQuantity).code === 'URGENT').length;
+const lowStockCount = activeStock.filter(i => (i.minQuantity || 0) > 0 && (i.quantity || 0) <= (i.minQuantity || 0)).length;
+const validCount = activeStock.filter(i => getItemStatus(i.validityDate, i.quantity, i.minQuantity).code === 'VALID').length;
+const exhaustedCount = stockItems.filter(i => (i.quantity || 0) <= 0).length;
+const recentMovements = historyLogs.slice(0, 8);
+const openNcCount = nonConformities.length;
+
+if (!dbReady) {
+  return (
+    <div className="min-h-screen flex flex-col items-center justify-center bg-slate-950 text-slate-100 gap-4">
+      <div className="bg-cyan-500 p-4 rounded-2xl shadow-lg shadow-cyan-500/30 text-slate-950">
+        <i className="fa-solid fa-database text-3xl fa-beat"></i>
+      </div>
+      <h2 className="text-lg font-extrabold">Carregando banco SQLite...</h2>
+      <p className="text-xs text-slate-400">Inicializando persistência local</p>
+    </div>
+  );
+}
+
+return (
+<div className="min-h-screen flex flex-col bg-slate-950 text-slate-100">
+{/* Header */}
+<header className="bg-slate-900 border-b border-slate-800 sticky top-0 z-30 no-print shadow-xl">
+<div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+<div className="flex items-center justify-between h-20">
+<div className="flex items-center space-x-3 cursor-pointer" onClick={() => setActiveTab('dashboard')}>
+<div className="bg-cyan-500 p-2.5 rounded-xl shadow-lg shadow-cyan-500/20 text-slate-950 font-black">
+<i className="fa-solid fa-microchip text-2xl"></i>
+</div>
+<div>
+<h1 className="font-extrabold text-xl tracking-tight text-white flex items-center gap-2">
+POP TIME <span className="text-xs px-2 py-0.5 bg-cyan-500 text-slate-950 font-bold rounded-full uppercase">PRO INDUSTRIAL</span>
+</h1>
+<p className="text-xs text-cyan-400 font-semibold">{companyName}</p>
+</div>
+</div>
+<div className="hidden md:flex items-center space-x-3 text-xs font-semibold">
+<div className="bg-slate-800/80 px-3 py-1.5 rounded-xl border border-slate-700/60">
+<span className="text-cyan-400"><i className="fa-solid fa-user-shield mr-1"></i> Admin:</span> <span className="text-white font-bold">{adminName}</span>
+</div>
+<div className="bg-emerald-950/60 text-emerald-400 px-3 py-1.5 rounded-xl border border-emerald-800/50">
+● Em estoque: <strong className="text-white">{activeStock.length}</strong>
+</div>
+{lowStockCount > 0 && (
+<div className="bg-orange-950/60 text-orange-300 px-3 py-1.5 rounded-xl border border-orange-800/50 animate-pulse">
+<i className="fa-solid fa-layer-group mr-1"></i> Mínimo: {lowStockCount}
+</div>
+)}
+{urgentCount > 0 && (
+<div className="bg-amber-950/60 text-amber-300 px-3 py-1.5 rounded-xl border border-amber-800/50">
+<i className="fa-solid fa-clock mr-1"></i> Atenção: {urgentCount}
+</div>
+)}
+{expiredCount > 0 && (
+<div className="bg-red-950/80 text-red-200 px-3 py-1.5 rounded-xl border border-red-700/60 animate-pulse">
+<i className="fa-solid fa-triangle-exclamation mr-1"></i> Vencidos: {expiredCount}
+</div>
+)}
+</div>
+</div>
+<nav className="flex space-x-1 border-t border-slate-800/60 py-2 overflow-x-auto">
+<button
+onClick={() => setActiveTab('dashboard')}
+className={`px-4 py-2 rounded-xl text-xs font-bold transition flex items-center gap-2 whitespace-nowrap ${
+activeTab === 'dashboard' ? 'bg-cyan-500 text-slate-950 shadow-md shadow-cyan-500/20' : 'text-slate-300 hover:bg-slate-800'
+}`}
+>
+<i className="fa-solid fa-chart-pie"></i> Dashboard
+</button>
+<button
+onClick={() => setActiveTab('new_label')}
+className={`px-4 py-2 rounded-xl text-xs font-bold transition flex items-center gap-2 whitespace-nowrap ${
+activeTab === 'new_label' ? 'bg-cyan-500 text-slate-950 shadow-md shadow-cyan-500/20' : 'text-slate-300 hover:bg-slate-800'
+}`}
+>
+<i className="fa-solid fa-circle-plus"></i> Entrada de Item
+</button>
+<button
+onClick={() => setActiveTab('etiqueta')}
+className={`px-4 py-2 rounded-xl text-xs font-bold transition flex items-center gap-2 whitespace-nowrap ${
+activeTab === 'etiqueta' ? 'bg-cyan-500 text-slate-950 shadow-md shadow-cyan-500/20' : 'text-slate-300 hover:bg-slate-800'
+}`}
+>
+<i className="fa-solid fa-tags"></i> Etiqueta
+</button>
+<button
+onClick={() => setActiveTab('stock')}
+className={`px-4 py-2 rounded-xl text-xs font-bold transition flex items-center gap-2 whitespace-nowrap ${
+activeTab === 'stock' ? 'bg-cyan-500 text-slate-950 shadow-md shadow-cyan-500/20' : 'text-slate-300 hover:bg-slate-800'
+}`}
+>
+<i className="fa-solid fa-boxes-stacked"></i> Controle de Ativos ({activeStock.length})
+</button>
+<button
+onClick={() => setActiveTab('scanner')}
+className={`px-4 py-2 rounded-xl text-xs font-bold transition flex items-center gap-2 whitespace-nowrap ${
+activeTab === 'scanner' ? 'bg-cyan-500 text-slate-950 shadow-md shadow-cyan-500/20' : 'text-slate-300 hover:bg-slate-800'
+}`}
+>
+<i className="fa-solid fa-qrcode"></i> Leitor QR
+</button>
+<button
+onClick={() => setActiveTab('history')}
+className={`px-4 py-2 rounded-xl text-xs font-bold transition flex items-center gap-2 whitespace-nowrap ${
+activeTab === 'history' ? 'bg-cyan-500 text-slate-950 shadow-md shadow-cyan-500/20' : 'text-slate-300 hover:bg-slate-800'
+}`}
+>
+<i className="fa-solid fa-right-left"></i> Histórico
+</button>
+<button
+onClick={() => setActiveTab('nonconform')}
+className={`px-4 py-2 rounded-xl text-xs font-bold transition flex items-center gap-2 whitespace-nowrap ${
+activeTab === 'nonconform' ? 'bg-cyan-500 text-slate-950 shadow-md shadow-cyan-500/20' : 'text-slate-300 hover:bg-slate-800'
+}`}
+>
+<i className="fa-solid fa-triangle-exclamation text-amber-400"></i> Não Conformidade
+</button>
+<button
+onClick={() => setActiveTab('admin')}
+className={`px-4 py-2 rounded-xl text-xs font-bold transition flex items-center gap-2 whitespace-nowrap ${
+activeTab === 'admin' ? 'bg-cyan-500 text-slate-950 shadow-md shadow-cyan-500/20' : 'text-slate-300 hover:bg-slate-800'
+}`}
+>
+<i className="fa-solid fa-sliders text-amber-400"></i> Administração
+</button>
+</nav>
+</div>
+</header>
+
+<main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 flex-grow w-full no-print">
+{/* Modal de Notificações */}
+{modalMessage && (
+<div className="fixed inset-0 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+<div className="bg-slate-900 border border-slate-700 rounded-2xl max-w-md w-full p-6 shadow-2xl text-slate-100 animate-in fade-in">
+<div className="flex items-center gap-3 mb-4">
+{modalMessage.type === 'success' && <i className="fa-solid fa-circle-check text-emerald-400 text-3xl"></i>}
+{modalMessage.type === 'error' && <i className="fa-solid fa-circle-xmark text-red-500 text-3xl"></i>}
+{modalMessage.type === 'warning' && <i className="fa-solid fa-triangle-exclamation text-amber-400 text-3xl"></i>}
+{modalMessage.type === 'info' && <i className="fa-solid fa-circle-info text-cyan-400 text-3xl"></i>}
+<div>
+<h3 className="text-lg font-bold text-white">{modalMessage.title}</h3>
+<p className="text-xs text-slate-300 mt-1">{modalMessage.text}</p>
+</div>
+</div>
+<div className="flex justify-end pt-3">
+<button
+onClick={() => setModalMessage(null)}
+className="px-5 py-2.5 bg-cyan-500 text-slate-950 rounded-xl text-xs font-black hover:bg-cyan-400 transition"
+>
+ENTENDIDO
+</button>
+</div>
+</div>
+</div>
+)}
+
+{/* Modal de Movimentação (Entrada/Saída) */}
+{actionModalItem && (
+<div className="fixed inset-0 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+<div className="bg-slate-900 border border-slate-700 rounded-2xl max-w-md w-full p-6 shadow-2xl text-slate-100">
+<h3 className="text-lg font-bold text-white flex items-center gap-2">
+<i className="fa-solid fa-right-left text-cyan-400"></i> Registrar Movimentação de Estoque
+</h3>
+<div className="bg-slate-950 p-3 rounded-xl border border-slate-800 my-3">
+<p className="text-xs text-slate-300">
+Equipamento/Insumo: <strong className="text-cyan-300">{actionModalItem.productName}</strong>
+</p>
+<div className="flex justify-between items-center mt-2 text-xs">
+<span className="text-slate-400">Saldo Atual: <strong className="text-white font-mono-code">{actionModalItem.quantity || 0} un.</strong></span>
+<span className="text-slate-400">Estoque Mínimo: <strong className="text-amber-400 font-mono-code">{actionModalItem.minQuantity || 0} un.</strong></span>
+</div>
+</div>
+<div className="space-y-4">
+<div>
+<label className="block text-xs font-bold text-slate-400 uppercase mb-1">Tipo de Movimentação:</label>
+<div className="grid grid-cols-2 gap-2">
+<button
+type="button"
+onClick={() => setMovementType('SAIDA')}
+className={`p-3 rounded-xl border font-bold text-xs flex items-center justify-center gap-2 ${
+movementType === 'SAIDA' ? 'bg-amber-500 text-slate-950 border-amber-400' : 'bg-slate-800 text-slate-300 border-slate-700'
+}`}
+>
+<i className="fa-solid fa-arrow-down-long"></i> SAÍDA / BAIXA
+</button>
+<button
+type="button"
+onClick={() => setMovementType('ENTRADA')}
+className={`p-3 rounded-xl border font-bold text-xs flex items-center justify-center gap-2 ${
+movementType === 'ENTRADA' ? 'bg-emerald-500 text-slate-950 border-emerald-400' : 'bg-slate-800 text-slate-300 border-slate-700'
+}`}
+>
+<i className="fa-solid fa-arrow-up-long"></i> ENTRADA / ADIÇÃO
+</button>
+</div>
+</div>
+<div>
+<label className="block text-xs font-bold text-slate-400 uppercase mb-1">
+Quantidade para {movementType === 'SAIDA' ? 'dar Baixa' : 'Adicionar'}:
+</label>
+<input
+type="number"
+min="1"
+max={movementType === 'SAIDA' ? actionModalItem.quantity || 9999 : 9999}
+value={movementQty}
+onChange={(e) => setMovementQty(e.target.value)}
+className="w-full p-3 bg-slate-800 border border-slate-700 rounded-xl text-center text-lg font-black text-white focus:ring-2 focus:ring-cyan-500"
+/>
+</div>
+<div>
+<label className="block text-xs font-bold text-slate-400 uppercase mb-1">Observações / Motivo:</label>
+<textarea
+rows="2"
+placeholder="Ex: Uso na ETE 01, troca preventiva, calibração..."
+value={actionNotes}
+onChange={(e) => setActionNotes(e.target.value)}
+className="w-full p-3 bg-slate-800 border border-slate-700 rounded-xl text-xs text-white focus:ring-2 focus:ring-cyan-500"
+></textarea>
+</div>
+</div>
+<div className="mt-6 flex justify-end gap-3">
+<button
+onClick={() => setActionModalItem(null)}
+className="px-4 py-2 bg-slate-800 text-slate-300 rounded-xl text-xs font-bold hover:bg-slate-700"
+>
+Cancelar
+</button>
+<button
+onClick={handleProcessAction}
+className="px-5 py-2 bg-cyan-500 text-slate-950 font-black rounded-xl text-xs hover:bg-cyan-400"
+>
+Confirmar Movimentação
+</button>
+</div>
+</div>
+</div>
+)}
+
+{/* Modal de EDIÇÃO COMPLETA DE ITEM */}
+{editModalItem && (
+<div className="fixed inset-0 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+<div className="bg-slate-900 border border-cyan-500/50 rounded-2xl max-w-2xl w-full p-6 shadow-2xl text-slate-100 max-h-[90vh] overflow-y-auto">
+<div className="flex items-center justify-between pb-3 border-b border-slate-800 mb-4">
+<h3 className="text-lg font-bold text-white flex items-center gap-2">
+<i className="fa-solid fa-pen-to-square text-cyan-400"></i> Editar Cadastro do Ativo
+</h3>
+<span className="text-xs font-mono-code text-cyan-400 bg-slate-800 px-2.5 py-1 rounded-lg">
+{editModalItem.id}
+</span>
+</div>
+<div className="space-y-4 text-xs">
+<div>
+<label className="block font-bold text-slate-300 uppercase mb-1">Descrição / Nome do Item <span className="text-red-400">*</span></label>
+<input
+type="text"
+value={editForm.productName}
+onChange={(e) => setEditForm({...editForm, productName: e.target.value})}
+className="w-full p-3 bg-slate-800 border border-slate-700 rounded-xl font-bold text-white focus:ring-2 focus:ring-cyan-500"
+/>
+</div>
+<div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+<div>
+<label className="block font-bold text-slate-300 uppercase mb-1">Categoria:</label>
+{categories.length > 0 ? (
+<select
+value={editForm.category}
+onChange={(e) => setEditForm({...editForm, category: e.target.value})}
+className="w-full p-3 bg-slate-800 border border-slate-700 rounded-xl font-semibold text-white"
+>
+<option value="Geral">Geral</option>
+{categories.map((cat, i) => <option key={i} value={cat}>{cat}</option>)}
+</select>
+) : (
+<input
+type="text"
+value={editForm.category}
+onChange={(e) => setEditForm({...editForm, category: e.target.value})}
+className="w-full p-3 bg-slate-800 border border-slate-700 rounded-xl font-semibold text-white"
+/>
+)}
+</div>
+<div>
+<label className="block font-bold text-slate-300 uppercase mb-1">Setor / Localização:</label>
+{sectors.length > 0 ? (
+<select
+value={editForm.sector}
+onChange={(e) => setEditForm({...editForm, sector: e.target.value})}
+className="w-full p-3 bg-slate-800 border border-slate-700 rounded-xl font-semibold text-white"
+>
+<option value="Estação Principal">Estação Principal</option>
+{sectors.map((sec, i) => <option key={i} value={sec}>{sec}</option>)}
+</select>
+) : (
+<input
+type="text"
+value={editForm.sector}
+onChange={(e) => setEditForm({...editForm, sector: e.target.value})}
+className="w-full p-3 bg-slate-800 border border-slate-700 rounded-xl font-semibold text-white"
+/>
+)}
+</div>
+</div>
+<div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+<div>
+<label className="block font-bold text-slate-300 uppercase mb-1">Nº de Série / TAG ID:</label>
+<input
+type="text"
+value={editForm.serialOrTag}
+onChange={(e) => setEditForm({...editForm, serialOrTag: e.target.value})}
+className="w-full p-3 bg-slate-800 border border-slate-700 rounded-xl font-semibold text-white"
+/>
+</div>
+<div>
+<label className="block font-bold text-slate-300 uppercase mb-1">Nº do Lote / Carga:</label>
+<input
+type="text"
+value={editForm.batchNumber}
+onChange={(e) => setEditForm({...editForm, batchNumber: e.target.value})}
+className="w-full p-3 bg-slate-800 border border-slate-700 rounded-xl font-semibold text-white"
+/>
+</div>
+</div>
+<div className="grid grid-cols-1 sm:grid-cols-2 gap-4 p-3 bg-slate-950 rounded-xl border border-slate-800">
+<div>
+<label className="block font-bold text-cyan-400 uppercase mb-1">Quantidade em Estoque:</label>
+<input
+type="number"
+min="0"
+value={editForm.quantity}
+onChange={(e) => setEditForm({...editForm, quantity: e.target.value})}
+className="w-full p-2.5 bg-slate-800 border border-cyan-500/60 rounded-xl font-black text-center text-lg text-white"
+/>
+</div>
+<div>
+<label className="block font-bold text-amber-400 uppercase mb-1">Quantidade Mínima (Estoque):</label>
+<input
+type="number"
+min="0"
+value={editForm.minQuantity}
+onChange={(e) => setEditForm({...editForm, minQuantity: e.target.value})}
+className="w-full p-2.5 bg-slate-800 border border-amber-500/60 rounded-xl font-black text-center text-lg text-white"
+/>
+</div>
+</div>
+<div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+<div>
+<label className="block font-bold text-slate-300 uppercase mb-1">Data Limite / Verificação Prevista:</label>
+<input
+type="datetime-local"
+value={editForm.validityDate}
+onChange={(e) => setEditForm({...editForm, validityDate: e.target.value})}
+className="w-full p-3 bg-slate-800 border border-slate-700 rounded-xl text-white font-semibold"
+/>
+</div>
+<div>
+<label className="block font-bold text-slate-300 uppercase mb-1">Operador / Responsável:</label>
+<input
+type="text"
+value={editForm.operator}
+onChange={(e) => setEditForm({...editForm, operator: e.target.value})}
+className="w-full p-3 bg-slate-800 border border-slate-700 rounded-xl text-white font-semibold"
+/>
+</div>
+</div>
+<div>
+<label className="block font-bold text-slate-300 uppercase mb-1">Observações Técnicas:</label>
+<textarea
+rows="2"
+value={editForm.technicalNotes}
+onChange={(e) => setEditForm({...editForm, technicalNotes: e.target.value})}
+className="w-full p-3 bg-slate-800 border border-slate-700 rounded-xl text-white font-semibold"
+></textarea>
+</div>
+</div>
+<div className="mt-6 flex justify-end gap-3 pt-3 border-t border-slate-800">
+<button
+onClick={() => setEditModalItem(null)}
+className="px-4 py-2 bg-slate-800 text-slate-300 rounded-xl font-bold hover:bg-slate-700"
+>
+Cancelar
+</button>
+<button
+onClick={handleSaveEdit}
+className="px-5 py-2 bg-cyan-500 text-slate-950 font-black rounded-xl hover:bg-cyan-400"
+>
+<i className="fa-solid fa-floppy-disk mr-1"></i> Salvar Alterações
+</button>
+</div>
+</div>
+</div>
+)}
+
+{/* Modal de Exclusão por Administrador */}
+{itemToDelete && (
+<div className="fixed inset-0 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+<div className="bg-slate-900 border border-red-800 rounded-2xl max-w-md w-full p-6 shadow-2xl text-slate-100">
+<h3 className="text-lg font-bold text-red-400 flex items-center gap-2">
+<i className="fa-solid fa-trash-can"></i> Excluir Registro
+</h3>
+<p className="text-xs text-slate-300 mt-2">
+Deseja remover permanentemente o registro de <strong className="text-white">{itemToDelete.productName}</strong> ({itemToDelete.id}) do banco de dados?
+</p>
+<div className="mt-6 flex justify-end gap-3">
+<button
+onClick={() => setItemToDelete(null)}
+className="px-4 py-2 bg-slate-800 text-slate-300 rounded-xl text-xs font-bold"
+>
+Cancelar
+</button>
+<button
+onClick={handleConfirmAdminDelete}
+className="px-5 py-2 bg-red-600 text-white font-extrabold rounded-xl text-xs hover:bg-red-500"
+>
+Excluir Definitivamente
+</button>
+</div>
+</div>
+</div>
+)}
+
+{/* ===================== ABA: DASHBOARD ===================== */}
+{activeTab === 'dashboard' && (
+<div className="space-y-6">
+<div className="bg-slate-900 p-6 rounded-2xl border border-slate-800 shadow-lg">
+<div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+<div>
+<h2 className="text-xl font-extrabold text-white flex items-center gap-2">
+<i className="fa-solid fa-chart-pie text-cyan-400"></i> Dashboard de Movimentação
+</h2>
+<p className="text-xs text-slate-400 mt-1">Visão geral do estoque, alertas e movimentações recentes.</p>
+</div>
+{stockItems.length === 0 && (
+<button
+onClick={loadSampleData}
+className="text-xs px-4 py-2 bg-cyan-950 text-cyan-300 border border-cyan-800 rounded-xl hover:bg-cyan-900 font-bold"
+>
+<i className="fa-solid fa-wand-magic-sparkles mr-1"></i> Carregar Dados Demo
+</button>
+)}
+</div>
+</div>
+
+{/* Cards de Status */}
+<div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+<div className="bg-emerald-950/60 border border-emerald-800/60 rounded-2xl p-5 text-center">
+<div className="text-3xl font-black text-emerald-400 font-mono-code">{validCount}</div>
+<div className="text-xs font-bold text-emerald-300 uppercase mt-1">Válidos / Conformidade</div>
+</div>
+<div className={`border rounded-2xl p-5 text-center ${lowStockCount > 0 ? 'bg-orange-950/80 border-orange-600 animate-pulse' : 'bg-orange-950/40 border-orange-800/40'}`}>
+<div className="text-3xl font-black text-orange-300 font-mono-code">{lowStockCount}</div>
+<div className="text-xs font-bold text-orange-200 uppercase mt-1">Estoque Mínimo</div>
+</div>
+<div className={`border rounded-2xl p-5 text-center ${urgentCount > 0 ? 'bg-amber-950/80 border-amber-600' : 'bg-amber-950/40 border-amber-800/40'}`}>
+<div className="text-3xl font-black text-amber-300 font-mono-code">{urgentCount}</div>
+<div className="text-xs font-bold text-amber-200 uppercase mt-1">Alerta (≤ 72h)</div>
+</div>
+<div className={`border rounded-2xl p-5 text-center ${expiredCount > 0 ? 'bg-red-950/80 border-red-600 animate-pulse' : 'bg-red-950/40 border-red-800/40'}`}>
+<div className="text-3xl font-black text-red-300 font-mono-code">{expiredCount}</div>
+<div className="text-xs font-bold text-red-200 uppercase mt-1">Vencidos</div>
+</div>
+</div>
+
+{/* Resumo extra */}
+<div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+<div className="bg-slate-900 border border-slate-800 rounded-2xl p-5">
+<div className="flex items-center justify-between">
+<span className="text-xs font-bold text-slate-400 uppercase">Total em Estoque</span>
+<i className="fa-solid fa-boxes-stacked text-cyan-400"></i>
+</div>
+<div className="text-2xl font-black text-white mt-2">{activeStock.length} <span className="text-sm text-slate-400 font-normal">itens ativos</span></div>
+</div>
+<div className="bg-slate-900 border border-slate-800 rounded-2xl p-5">
+<div className="flex items-center justify-between">
+<span className="text-xs font-bold text-slate-400 uppercase">Sem Estoque</span>
+<i className="fa-solid fa-box-open text-slate-500"></i>
+</div>
+<div className="text-2xl font-black text-slate-300 mt-2">{exhaustedCount} <span className="text-sm text-slate-500 font-normal">zerados</span></div>
+</div>
+<div className="bg-slate-900 border border-slate-800 rounded-2xl p-5">
+<div className="flex items-center justify-between">
+<span className="text-xs font-bold text-slate-400 uppercase">Não Conformidades</span>
+<i className="fa-solid fa-triangle-exclamation text-amber-400"></i>
+</div>
+<div className="text-2xl font-black text-amber-300 mt-2">{openNcCount} <span className="text-sm text-slate-400 font-normal">registros</span></div>
+</div>
+</div>
+
+{/* Últimas Movimentações */}
+<div className="bg-slate-900 rounded-2xl border border-slate-800 overflow-hidden shadow-lg">
+<div className="px-6 py-4 border-b border-slate-800 flex items-center justify-between">
+<h3 className="text-sm font-bold text-white uppercase flex items-center gap-2">
+<i className="fa-solid fa-clock-rotate-left text-cyan-400"></i> Últimas Movimentações
+</h3>
+<button onClick={() => setActiveTab('history')} className="text-xs text-cyan-400 hover:underline font-bold">Ver histórico completo →</button>
+</div>
+{recentMovements.length === 0 ? (
+<div className="p-8 text-center text-slate-500 text-xs">Nenhuma movimentação registrada ainda.</div>
+) : (
+<div className="overflow-x-auto">
+<table className="w-full text-left text-xs">
+<thead>
+<tr className="bg-slate-950 border-b border-slate-800 text-slate-400 font-extrabold uppercase">
+<th className="p-3">Data/Hora</th>
+<th className="p-3">Tipo</th>
+<th className="p-3">Item</th>
+<th className="p-3 text-center">Qtd</th>
+<th className="p-3">Operador</th>
+</tr>
+</thead>
+<tbody className="divide-y divide-slate-800">
+{recentMovements.map(log => (
+<tr key={log.id} className="hover:bg-slate-800/50">
+<td className="p-3 font-mono-code text-slate-400">{formatDateTime(log.timestamp)}</td>
+<td className="p-3">
+{log.type === 'ENTRADA' && <span className="px-2 py-0.5 bg-emerald-950 text-emerald-300 border border-emerald-800 rounded font-bold">ENTRADA</span>}
+{log.type === 'SAÍDA' && <span className="px-2 py-0.5 bg-amber-950 text-amber-300 border border-amber-800 rounded font-bold">SAÍDA</span>}
+{log.type === 'EDIÇÃO' && <span className="px-2 py-0.5 bg-cyan-950 text-cyan-300 border border-cyan-800 rounded font-bold">EDIÇÃO</span>}
+{log.type === 'EXCLUSÃO ADM' && <span className="px-2 py-0.5 bg-red-950 text-red-300 border border-red-800 rounded font-bold">EXCLUÍDO</span>}
+{log.type === 'NÃO CONFORMIDADE' && <span className="px-2 py-0.5 bg-orange-950 text-orange-300 border border-orange-800 rounded font-bold">NC</span>}
+</td>
+<td className="p-3 font-bold text-white">{log.productName}</td>
+<td className="p-3 text-center font-mono-code">
+{log.type === 'ENTRADA' ? <span className="text-emerald-400">+{log.movementAmount || 0}</span> :
+log.type === 'SAÍDA' ? <span className="text-amber-400">{log.movementAmount || 0}</span> :
+<span className="text-slate-500">--</span>}
+</td>
+<td className="p-3 text-slate-300">{log.operator}</td>
+</tr>
+))}
+</tbody>
+</table>
+</div>
+)}
+</div>
+</div>
+)}
+
+{/* ===================== ABA: Entrada de Item ===================== */}
+{activeTab === 'new_label' && (
+<div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
+<div className="lg:col-span-7 bg-slate-900 p-6 sm:p-8 rounded-2xl border border-slate-800 shadow-xl">
+<div className="flex items-center justify-between pb-4 border-b border-slate-800">
+<h2 className="text-xl font-extrabold text-white flex items-center gap-2">
+<i className="fa-solid fa-boxes-packing text-cyan-400"></i> Entrada em Novo Item
+</h2>
+{stockItems.length === 0 && (
+<button
+onClick={loadSampleData}
+className="text-xs px-3 py-1 bg-cyan-950 text-cyan-300 border border-cyan-800 rounded-lg hover:bg-cyan-900 font-bold"
+>
+<i className="fa-solid fa-wand-magic-sparkles mr-1"></i> Carregar Dados Demo
+</button>
+)}
+</div>
+<div className="space-y-5 mt-6">
+<div>
+<label className="block text-xs font-bold text-slate-300 uppercase mb-1">
+Descrição do Equipamento, Componente ou Reativo <span className="text-red-400">*</span>
+</label>
+<input
+type="text"
+placeholder="Ex: Polímero Aniónico, Filtro Prensa, Bomba Dosadora..."
+value={productName}
+onChange={(e) => setProductName(e.target.value)}
+className="w-full p-3 bg-slate-800/80 border border-slate-700 rounded-xl font-bold text-white placeholder-slate-500 focus:ring-2 focus:ring-cyan-500"
+/>
+</div>
+<div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+<div>
+<label className="block text-xs font-bold text-slate-300 uppercase mb-1">Categoria de Ativo:</label>
+{categories.length > 0 ? (
+<select
+value={selectedCategory}
+onChange={(e) => setSelectedCategory(e.target.value)}
+className="w-full p-3 bg-slate-800 border border-slate-700 rounded-xl text-sm font-semibold text-white focus:ring-2 focus:ring-cyan-500"
+>
+<option value="">-- Selecione Categoria --</option>
+{categories.map((cat, index) => (
+<option key={index} value={cat}>{cat}</option>
+))}
+</select>
+) : (
+<input
+type="text"
+placeholder="Ex: Equipamentos, Reativos..."
+value={selectedCategory}
+onChange={(e) => setSelectedCategory(e.target.value)}
+className="w-full p-3 bg-slate-800 border border-slate-700 rounded-xl text-sm font-semibold text-white"
+/>
+)}
+</div>
+<div>
+<label className="block text-xs font-bold text-slate-300 uppercase mb-1">Setor / Localização:</label>
+{sectors.length > 0 ? (
+<select
+value={selectedSector}
+onChange={(e) => setSelectedSector(e.target.value)}
+className="w-full p-3 bg-slate-800 border border-slate-700 rounded-xl text-sm font-semibold text-white focus:ring-2 focus:ring-cyan-500"
+>
+<option value="">-- Selecione o Setor --</option>
+{sectors.map((sec, index) => (
+<option key={index} value={sec}>{sec}</option>
+))}
+</select>
+) : (
+<input
+type="text"
+placeholder="Ex: Tanque ETE 01, Decantador..."
+value={selectedSector}
+onChange={(e) => setSelectedSector(e.target.value)}
+className="w-full p-3 bg-slate-800 border border-slate-700 rounded-xl text-sm font-semibold text-white"
+/>
+)}
+</div>
+</div>
+<div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+<div>
+<label className="block text-xs font-bold text-slate-300 uppercase mb-1">Nº de Série / TAG ID:</label>
+<input
+type="text"
+placeholder="Ex: TAG-EFL-2026 / SN-8890"
+value={serialOrTag}
+onChange={(e) => setSerialOrTag(e.target.value)}
+className="w-full p-3 bg-slate-800 border border-slate-700 rounded-xl text-sm font-semibold text-white"
+/>
+</div>
+<div>
+<label className="block text-xs font-bold text-slate-300 uppercase mb-1">Operador / Resp. Técnico:</label>
+<input
+type="text"
+value={operatorName}
+onChange={(e) => setOperatorName(e.target.value)}
+placeholder={`Padrão: ${adminName}`}
+className="w-full p-3 bg-slate-800 border border-slate-700 rounded-xl text-sm font-semibold text-white"
+/>
+</div>
+</div>
+{/* Calculations block */}
+<div className="p-4 bg-slate-800/80 border border-slate-700 rounded-2xl space-y-4">
+<div className="flex items-center justify-between">
+<span className="text-xs font-extrabold text-cyan-400 uppercase tracking-wide">
+<i className="fa-solid fa-clock mr-1"></i> Prazo de Validade / Verificação Prevista
+</span>
+<button
+type="button"
+onClick={() => setCreationDate(getNowIsoLocal())}
+className="text-xs font-bold text-cyan-300 hover:underline"
+>
+Usar Data Atual
+</button>
+</div>
+<div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+<div>
+<label className="block text-xs font-semibold text-slate-400 mb-1">Data / Hora de Entrada:</label>
+<input
+type="datetime-local"
+value={creationDate}
+onChange={(e) => setCreationDate(e.target.value)}
+className="w-full p-2.5 bg-slate-900 border border-slate-700 rounded-xl text-xs font-semibold text-white"
+/>
+</div>
+<div>
+<label className="block text-xs font-semibold text-slate-400 mb-1">Período de Validade / Verificação:</label>
+<div className="flex gap-2">
+<input
+type="number"
+min="1"
+value={validityValue}
+onChange={(e) => setValidityValue(e.target.value)}
+className="w-1/2 p-2.5 bg-slate-900 border border-slate-700 rounded-xl text-xs font-bold text-center text-white"
+/>
+<select
+value={validityUnit}
+onChange={(e) => setValidityUnit(e.target.value)}
+className="w-1/2 p-2.5 bg-slate-900 border border-slate-700 rounded-xl text-xs font-semibold text-white"
+>
+<option value="hours">Horas</option>
+<option value="days">Dias</option>
+<option value="months">Meses</option>
+</select>
+</div>
+</div>
+</div>
+<div className="pt-2 border-t border-slate-700 flex items-center justify-between">
+<span className="text-xs text-slate-300 font-bold">Data Limite / Verificação Prevista:</span>
+<span className="text-sm font-extrabold text-cyan-400 font-mono-code bg-slate-900 px-3 py-1 rounded-lg border border-slate-700">
+{formatDateTime(calculatedValidity)}
+</span>
+</div>
+</div>
+<div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+<div>
+<label className="block text-xs font-bold text-cyan-400 uppercase mb-1">Qtd. Inicial Entrando:</label>
+<input
+type="number"
+min="1"
+max="99999"
+value={quantity}
+onChange={(e) => setQuantity(e.target.value)}
+className="w-full p-2.5 bg-slate-800 border-2 border-cyan-500 rounded-xl text-xs font-black text-center text-white focus:ring-2 focus:ring-cyan-400"
+/>
+</div>
+<div>
+<label className="block text-xs font-bold text-amber-400 uppercase mb-1">Qtd. Mínima (Alerta):</label>
+<input
+type="number"
+min="0"
+max="99999"
+value={minQuantity}
+onChange={(e) => setMinQuantity(e.target.value)}
+className="w-full p-2.5 bg-slate-800 border-2 border-amber-500/70 rounded-xl text-xs font-black text-center text-white focus:ring-2 focus:ring-amber-400"
+/>
+</div>
+<div>
+<label className="block text-xs font-bold text-slate-300 uppercase mb-1">Nº do Lote / Carga:</label>
+<input
+type="text"
+placeholder="Ex: LT-8801"
+value={batchNumber}
+onChange={(e) => setBatchNumber(e.target.value)}
+className="w-full p-2.5 bg-slate-800 border border-slate-700 rounded-xl text-xs text-white"
+/>
+</div>
+</div>
+<div>
+<label className="block text-xs font-bold text-slate-300 uppercase mb-1">Obs. Técnicas:</label>
+<input
+type="text"
+placeholder="Ex: Pressão 5 bar, armazenar ao abrigo da luz..."
+value={technicalNotes}
+onChange={(e) => setTechnicalNotes(e.target.value)}
+className="w-full p-2.5 bg-slate-800 border border-slate-700 rounded-xl text-xs text-white"
+/>
+</div>
+<div className="pt-4 flex flex-col sm:flex-row gap-3">
+<button
+onClick={() => handleCreateLabel(false)}
+className="flex-1 py-3.5 px-4 bg-slate-800 text-white rounded-xl font-bold text-xs hover:bg-slate-700 transition flex items-center justify-center gap-2 border border-slate-700"
+>
+<i className="fa-solid fa-floppy-disk text-cyan-400"></i> Registrar Entrada no Estoque
+</button>
+<button
+onClick={() => handleCreateLabel(true)}
+className="flex-1 py-3.5 px-4 bg-cyan-500 text-slate-950 rounded-xl font-black text-xs hover:bg-cyan-400 transition flex items-center justify-center gap-2 shadow-lg shadow-cyan-500/20"
+>
+<i className="fa-solid fa-print"></i> Entrada & Imprimir Tag
+</button>
+</div>
+</div>
+</div>
+{/* Preview Column */}
+<div className="lg:col-span-5 space-y-4">
+<div className="bg-slate-900 text-white p-4 rounded-2xl border border-slate-800 flex items-center justify-between">
+<span className="text-xs font-bold uppercase text-cyan-400 flex items-center gap-2">
+<i className="fa-solid fa-eye"></i> Pré-visualização da Etiqueta
+</span>
+<span className="text-[10px] text-slate-400 font-mono-code">60x40mm Padrão</span>
+</div>
+<IndustrialLabelCard
+productName={productName || 'NOME DO EQUIPAMENTO / REATIVO'}
+category={selectedCategory || 'Geral'}
+sector={selectedSector || 'Estação ETE'}
+serialOrTag={serialOrTag || 'TAG-0000'}
+creationDate={creationDate}
+validityDate={calculatedValidity}
+operator={operatorName || adminName}
+batchNumber={batchNumber || 'LT-001'}
+technicalNotes={technicalNotes}
+labelId="TAG-PREVIEW"
+companyName={companyName}
+/>
+</div>
+</div>
+)}
+
+{/* ===================== ABA: ETIQUETA (impressão de tags existentes) ===================== */}
+{activeTab === 'etiqueta' && (
+<div className="space-y-6">
+<div className="bg-slate-900 p-6 rounded-2xl border border-slate-800 shadow-lg">
+<h2 className="text-xl font-extrabold text-white flex items-center gap-2">
+<i className="fa-solid fa-tags text-cyan-400"></i> Geração e Impressão de Etiquetas
+</h2>
+<p className="text-xs text-slate-400 mt-1">Selecione itens do estoque para gerar e imprimir etiquetas com QR Code. A etiqueta não exibe quantidade.</p>
+</div>
+{stockItems.length === 0 ? (
+<div className="bg-slate-900 rounded-2xl p-12 text-center border border-slate-800">
+<i className="fa-solid fa-folder-open text-4xl text-slate-600 mb-3"></i>
+<h3 className="text-lg font-bold text-slate-300">Nenhum item no estoque</h3>
+<p className="text-xs text-slate-500 mt-1 mb-4">Cadastre itens na aba Entrada de Item primeiro.</p>
+<button onClick={() => setActiveTab('new_label')} className="px-5 py-2.5 bg-cyan-500 text-slate-950 font-black rounded-xl text-xs">
+Ir para Entrada de Item
+</button>
+</div>
+) : (
+<div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+{stockItems.filter(i => (i.quantity || 0) > 0).map(item => (
+<div key={item.id} className="bg-slate-900 rounded-2xl border border-slate-800 overflow-hidden shadow-md">
+<div className="p-4 border-b border-slate-800">
+<span className="text-[10px] uppercase font-extrabold text-cyan-400 bg-cyan-950/80 px-2 py-0.5 rounded border border-cyan-800/50">{item.category}</span>
+<h3 className="font-extrabold text-white text-sm mt-1">{item.productName}</h3>
+<p className="text-xs text-slate-400 mt-0.5">TAG: {item.serialOrTag} | {item.id}</p>
+</div>
+<div className="p-4 flex justify-center">
+<img src={getQrCodeUrl(item.id)} alt="QR" className="w-28 h-28 bg-white p-1 rounded" />
+</div>
+<div className="px-4 pb-4 flex gap-2">
+<button
+onClick={() => {
+setPrintBatchItems([item]);
+setTimeout(() => window.print(), 300);
+}}
+className="flex-1 py-2.5 bg-cyan-500 text-slate-950 font-black rounded-xl text-xs hover:bg-cyan-400 flex items-center justify-center gap-1"
+>
+<i className="fa-solid fa-print"></i> Imprimir Etiqueta
+</button>
+</div>
+</div>
+))}
+</div>
+)}
+</div>
+)}
+
+{/* ===================== ABA: Controle de Ativos ===================== */}
+{activeTab === 'stock' && (
+<div className="space-y-6">
+<div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 bg-slate-900 p-6 rounded-2xl border border-slate-800 shadow-lg">
+<div>
+<h2 className="text-xl font-extrabold text-white flex items-center gap-2">
+<i className="fa-solid fa-boxes-stacked text-cyan-400"></i> Controle de Ativos e Estoque
+</h2>
+<p className="text-xs text-slate-400 mt-1">Gerencie saldo, edite informações do cadastro ou dê saídas/entradas rápidas.</p>
+</div>
+<div className="flex flex-wrap items-center gap-2 text-xs font-bold">
+<span className="px-3 py-1.5 bg-emerald-950/80 text-emerald-400 border border-emerald-800/60 rounded-xl">🟢 Válidos: {validCount}</span>
+<span className={`px-3 py-1.5 border rounded-xl ${lowStockCount > 0 ? 'bg-orange-950/90 text-orange-200 border-orange-600 animate-pulse' : 'bg-orange-950/80 text-orange-300 border-orange-800/60'}`}>🟧 Mínimo: {lowStockCount}</span>
+<span className="px-3 py-1.5 bg-amber-950/80 text-amber-300 border border-amber-800/60 rounded-xl">🟡 Alerta: {urgentCount}</span>
+<span className="px-3 py-1.5 bg-red-950/80 text-red-300 border border-red-800/60 rounded-xl">🔴 Vencidos: {expiredCount}</span>
+<button onClick={exportCSV} className="px-3 py-1.5 bg-slate-800 text-cyan-300 border border-slate-700 rounded-xl hover:bg-slate-700">
+<i className="fa-solid fa-file-csv mr-1"></i> Exportar CSV
+</button>
+</div>
+</div>
+
+{/* PAINEL DE FILTROS */}
+<div className="bg-slate-900/90 p-5 rounded-2xl border border-slate-800 space-y-4 shadow-md">
+<div className="flex items-center justify-between pb-2 border-b border-slate-800">
+<span className="text-xs font-extrabold text-cyan-400 uppercase flex items-center gap-2">
+<i className="fa-solid fa-filter"></i> Filtros e Busca Avançada
+</span>
+<button
+onClick={() => {
+setStockSearch('');
+setStockCategoryFilter('');
+setStockSectorFilter('');
+setStockStatusFilter('ALL');
+setShowExhausted(false);
+}}
+className="text-xs text-slate-400 hover:text-cyan-300 underline"
+>
+Limpar Filtros
+</button>
+</div>
+<div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 text-xs">
+<div>
+<label className="block text-slate-400 font-bold mb-1">Buscar por Nome, TAG, Lote ou ID:</label>
+<div className="relative">
+<i className="fa-solid fa-magnifying-glass absolute left-3 top-3 text-slate-500"></i>
+<input
+type="text"
+placeholder="Digite para pesquisar..."
+value={stockSearch}
+onChange={(e) => setStockSearch(e.target.value)}
+className="w-full pl-9 pr-3 py-2.5 bg-slate-800 border border-slate-700 rounded-xl text-white focus:ring-2 focus:ring-cyan-500 font-medium"
+/>
+</div>
+</div>
+<div>
+<label className="block text-slate-400 font-bold mb-1">Filtrar por Categoria:</label>
+<select
+value={stockCategoryFilter}
+onChange={(e) => setStockCategoryFilter(e.target.value)}
+className="w-full p-2.5 bg-slate-800 border border-slate-700 rounded-xl text-white font-semibold"
+>
+<option value="">Todas as Categorias</option>
+{categories.map((cat, idx) => (
+<option key={idx} value={cat}>{cat}</option>
+))}
+</select>
+</div>
+<div>
+<label className="block text-slate-400 font-bold mb-1">Filtrar por Setor:</label>
+<select
+value={stockSectorFilter}
+onChange={(e) => setStockSectorFilter(e.target.value)}
+className="w-full p-2.5 bg-slate-800 border border-slate-700 rounded-xl text-white font-semibold"
+>
+<option value="">Todos os Setores</option>
+{sectors.map((sec, idx) => (
+<option key={idx} value={sec}>{sec}</option>
+))}
+</select>
+</div>
+<div>
+<label className="block text-slate-400 font-bold mb-1">Filtrar por Status / Situação:</label>
+<select
+value={stockStatusFilter}
+onChange={(e) => setStockStatusFilter(e.target.value)}
+className="w-full p-2.5 bg-slate-800 border border-slate-700 rounded-xl text-white font-semibold"
+>
+<option value="ALL">Todos os Status</option>
+<option value="VALID">Em Conformidade / Operacional</option>
+<option value="LOW_STOCK">Estoque Crítico (≤ Mínimo)</option>
+<option value="URGENT">Próximo do Prazo (≤ 72h)</option>
+<option value="EXPIRED">Vencido / Verificação Necessária</option>
+</select>
+</div>
+</div>
+<div className="pt-2 border-t border-slate-800/80 flex items-center justify-between text-xs">
+<label className="flex items-center gap-2 cursor-pointer text-slate-300 font-medium">
+<input
+type="checkbox"
+checked={showExhausted}
+onChange={(e) => setShowExhausted(e.target.checked)}
+className="w-4 h-4 accent-cyan-500 rounded cursor-pointer"
+/>
+<span>Exibir itens sem estoque (zerados) no catálogo ({exhaustedCount} zerados)</span>
+</label>
+<span className="text-slate-400">
+Exibindo <strong>{filteredStock.length}</strong> de <strong>{stockItems.length}</strong> itens
+</span>
+</div>
+</div>
+
+{filteredStock.length === 0 ? (
+<div className="bg-slate-900 rounded-2xl p-12 text-center border border-slate-800">
+<i className="fa-solid fa-folder-open text-4xl text-slate-600 mb-3"></i>
+<h3 className="text-lg font-bold text-slate-300">Nenhum item localizado com os filtros atuais</h3>
+<p className="text-xs text-slate-500 max-w-md mx-auto mt-1 mb-6">
+{stockItems.length === 0 ? 'O estoque está sem registros. Dê entrada em novos itens ou carregue dados de demonstração.' : 'Tente alterar os filtros de pesquisa.'}
+</p>
+{stockItems.length === 0 && (
+<div className="flex justify-center gap-3">
+<button onClick={() => setActiveTab('new_label')} className="px-5 py-2.5 bg-cyan-500 text-slate-950 font-black rounded-xl text-xs shadow-lg shadow-cyan-500/20">
+<i className="fa-solid fa-plus mr-1"></i> Cadastrar Item
+</button>
+<button onClick={loadSampleData} className="px-5 py-2.5 bg-slate-800 text-cyan-300 border border-slate-700 font-bold rounded-xl text-xs hover:bg-slate-700">
+<i className="fa-solid fa-wand-magic-sparkles mr-1"></i> Dados Demo
+</button>
+</div>
+)}
+</div>
+) : (
+<div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+{filteredStock.map((item) => {
+const statusInfo = getItemStatus(item.validityDate, item.quantity, item.minQuantity || 0);
+const isLowStock = (item.minQuantity > 0 && item.quantity <= item.minQuantity && item.quantity > 0);
+return (
+<div key={item.id} className={`bg-slate-900 rounded-2xl border overflow-hidden flex flex-col justify-between shadow-md ${isLowStock ? 'border-orange-600 ring-1 ring-orange-500/40' : 'border-slate-800'}`}>
+<div>
+<div className={`px-4 py-2 flex items-center justify-between text-xs font-bold ${statusInfo.color}`}>
+<span><i className="fa-solid fa-shield-halved mr-1"></i> {statusInfo.label}</span>
+<span className="font-mono-code">{item.id}</span>
+</div>
+{/* Alerta permanente de estoque mínimo */}
+{isLowStock && (
+<div className="px-4 py-1.5 bg-orange-600 text-white text-[10px] font-black uppercase flex items-center gap-2 animate-pulse">
+<i className="fa-solid fa-bell"></i> ALERTA: Estoque abaixo do mínimo ({item.quantity} ≤ {item.minQuantity})
+</div>
+)}
+<div className="p-5 space-y-3">
+<div className="flex items-start justify-between gap-2">
+<div>
+<span className="text-[10px] uppercase tracking-wide font-extrabold text-cyan-400 bg-cyan-950/80 px-2 py-0.5 rounded border border-cyan-800/50">
+{item.category}
+</span>
+<h3 className="font-extrabold text-white text-base mt-1">{item.productName}</h3>
+</div>
+<div className={`text-right px-3 py-1.5 rounded-xl border ${
+isLowStock ? 'bg-orange-950/90 border-orange-600' : 'bg-slate-950 border-slate-800'
+}`}>
+<span className="text-[10px] font-bold text-slate-400 uppercase block">Estoque</span>
+<span className={`text-lg font-black font-mono-code ${isLowStock ? 'text-orange-300' : 'text-cyan-400'}`}>
+{item.quantity || 0} <span className="text-xs text-slate-400 font-normal">un</span>
+</span>
+</div>
+</div>
+<div className="flex justify-between items-center text-xs text-slate-400">
+<span><i className="fa-solid fa-location-dot text-slate-500 mr-1"></i> Setor: <strong className="text-slate-200">{item.sector}</strong></span>
+<span className="text-slate-400">Mínimo: <strong className="text-amber-400 font-mono-code">{item.minQuantity || 0} un</strong></span>
+</div>
+<div className="bg-slate-950/80 p-3 rounded-xl border border-slate-800 space-y-1.5 text-xs">
+<div className="flex justify-between text-slate-400">
+<span>TAG / Série:</span>
+<span className="font-mono-code text-white font-bold">{item.serialOrTag}</span>
+</div>
+<div className="flex justify-between text-slate-400">
+<span>Entrada Inicial:</span>
+<span className="text-slate-200">{formatDateTime(item.creationDate)}</span>
+</div>
+<div className="flex justify-between text-slate-100 font-bold pt-1 border-t border-slate-800">
+<span>Data Limite / Verificação:</span>
+<span className="text-cyan-400 font-mono-code">{formatDateTime(item.validityDate)}</span>
+</div>
+</div>
+<div className="flex justify-between text-xs text-slate-400">
+<span>Resp: <strong className="text-slate-200">{item.operator}</strong></span>
+<span>Lote: <strong className="text-slate-200">{item.batchNumber}</strong></span>
+</div>
+</div>
+</div>
+<div className="px-5 py-3 bg-slate-950 border-t border-slate-800 flex flex-wrap gap-2">
+<button
+onClick={() => {
+setActionModalItem(item);
+setMovementType('SAIDA');
+setMovementQty(1);
+}}
+className="flex-1 py-2 bg-amber-600 text-slate-950 rounded-xl text-xs font-black hover:bg-amber-500 transition flex items-center justify-center gap-1"
+title="Dar baixa/saída"
+>
+<i className="fa-solid fa-arrow-down-long"></i> Saída
+</button>
+<button
+onClick={() => {
+setActionModalItem(item);
+setMovementType('ENTRADA');
+setMovementQty(1);
+}}
+className="flex-1 py-2 bg-emerald-600 text-white rounded-xl text-xs font-bold hover:bg-emerald-500 transition flex items-center justify-center gap-1"
+title="Adicionar entrada"
+>
+<i className="fa-solid fa-arrow-up-long"></i> Entrada
+</button>
+<button
+onClick={() => handleOpenEditModal(item)}
+className="p-2 bg-cyan-950 text-cyan-300 border border-cyan-800 rounded-xl text-xs hover:bg-cyan-900 transition"
+title="Editar Informações do Cadastro"
+>
+<i className="fa-solid fa-pen-to-square"></i> Editar
+</button>
+<button
+onClick={() => {
+setPrintBatchItems([item]);
+setTimeout(() => window.print(), 300);
+}}
+className="p-2 bg-slate-800 text-slate-300 rounded-xl text-xs hover:bg-slate-700 border border-slate-700"
+title="Imprimir Tag"
+>
+<i className="fa-solid fa-print"></i>
+</button>
+<button
+onClick={() => setItemToDelete(item)}
+className="p-2 bg-red-950 text-red-400 hover:bg-red-900 rounded-xl text-xs border border-red-800"
+title="Excluir do Estoque"
+>
+<i className="fa-solid fa-trash-can"></i>
+</button>
+</div>
+</div>
+);
+})}
+</div>
+)}
+</div>
+)}
+
+{/* ===================== ABA: Leitor QR ===================== */}
+{activeTab === 'scanner' && (
+<div className="max-w-xl mx-auto space-y-6">
+<div className="bg-slate-900 p-6 rounded-2xl border border-slate-800 shadow-lg text-center">
+<div className="w-12 h-12 bg-cyan-950 text-cyan-400 border border-cyan-800 rounded-2xl flex items-center justify-center mx-auto mb-3 text-xl">
+<i className="fa-solid fa-qrcode"></i>
+</div>
+<h2 className="text-xl font-bold text-white">Leitor de QR Code & Consulta Rápida</h2>
+<p className="text-xs text-slate-400 mt-1 mb-4">
+Escaneie a etiqueta impressa no equipamento ou digite o código/TAG.
+</p>
+<form onSubmit={handleManualSearch} className="flex gap-2">
+<input
+type="text"
+placeholder="Código Tag ID (Ex: TAG-1234 ou POL-2026-A1)"
+value={manualSearchId}
+onChange={(e) => setManualSearchId(e.target.value)}
+className="flex-1 p-3 bg-slate-800 border border-slate-700 rounded-xl text-xs font-bold text-white uppercase focus:ring-2 focus:ring-cyan-500"
+/>
+<button type="submit" className="px-5 py-3 bg-cyan-500 text-slate-950 font-black rounded-xl text-xs hover:bg-cyan-400">
+Localizar
+</button>
+</form>
+</div>
+<div className="bg-slate-900 p-6 rounded-2xl border border-slate-800 shadow-lg space-y-4">
+<h3 className="text-xs font-bold uppercase text-slate-300 flex items-center gap-2">
+<i className="fa-solid fa-camera text-cyan-400"></i> Câmera traseira
+</h3>
+<IndustrialQrScannerComponent
+onScanSuccess={(decodedText) => {
+const found = stockItems.find(s => s.id === decodedText || (s.serialOrTag && s.serialOrTag === decodedText) || decodedText.includes(s.id));
+if (found) {
+setScannedResult(found);
+} else {
+setModalMessage({ type: 'error', title: 'Registro Não Encontrado', text: `Tag escaneada "${decodedText}" não foi encontrada na base.` });
+}
+}}
+/>
+</div>
+{scannedResult && (
+<div className="p-6 bg-slate-900 border-2 border-cyan-500 text-white rounded-2xl shadow-2xl space-y-4">
+<div className="flex justify-between items-center pb-2 border-b border-slate-800">
+<span className="text-xs font-bold text-cyan-400 flex items-center gap-1">
+<i className="fa-solid fa-circle-check"></i> Registro Encontrado
+</span>
+<span className="text-xs font-mono-code text-slate-400">{scannedResult.id}</span>
+</div>
+<div className="flex justify-between items-start">
+<div>
+<span className="text-[10px] font-extrabold uppercase bg-cyan-950 text-cyan-300 px-2 py-0.5 rounded border border-cyan-800">
+{scannedResult.category}
+</span>
+<h3 className="text-lg font-extrabold mt-1">{scannedResult.productName}</h3>
+<p className="text-xs text-slate-400">Setor: {scannedResult.sector} | TAG: {scannedResult.serialOrTag}</p>
+</div>
+<div className="text-right bg-slate-950 px-3 py-1.5 rounded-xl border border-slate-800">
+<span className="text-[10px] text-slate-400 uppercase font-bold block">Qtd Atual</span>
+<span className="text-lg font-black text-cyan-400 font-mono-code">{scannedResult.quantity || 0}</span>
+</div>
+</div>
+<div className="grid grid-cols-2 gap-2 text-xs bg-slate-950 p-3 rounded-xl border border-slate-800">
+<div>
+<span className="text-slate-400 block">Cadastrado em:</span>
+<span>{formatDateTime(scannedResult.creationDate)}</span>
+</div>
+<div>
+<span className="text-slate-400 block">Data Limite / Verificação:</span>
+<span className="text-cyan-400 font-bold">{formatDateTime(scannedResult.validityDate)}</span>
+</div>
+</div>
+<div className="flex gap-2 pt-2">
+<button
+onClick={() => {
+setActionModalItem(scannedResult);
+setMovementType('SAIDA');
+setMovementQty(1);
+}}
+className="flex-1 py-3 bg-amber-500 text-slate-950 font-black rounded-xl text-xs hover:bg-amber-400 flex items-center justify-center gap-1"
+>
+<i className="fa-solid fa-arrow-down-long"></i> Dar Saída
+</button>
+<button
+onClick={() => {
+setActionModalItem(scannedResult);
+setMovementType('ENTRADA');
+setMovementQty(1);
+}}
+className="flex-1 py-3 bg-emerald-600 text-white font-bold rounded-xl text-xs hover:bg-emerald-500 flex items-center justify-center gap-1"
+>
+<i className="fa-solid fa-arrow-up-long"></i> Entrada
+</button>
+<button
+onClick={() => handleOpenEditModal(scannedResult)}
+className="px-4 py-3 bg-cyan-950 text-cyan-300 border border-cyan-800 font-bold rounded-xl text-xs hover:bg-cyan-900"
+>
+Editar
+</button>
+</div>
+</div>
+)}
+</div>
+)}
+
+{/* ===================== ABA: Histórico ===================== */}
+{activeTab === 'history' && (
+<div className="space-y-6">
+<div className="flex flex-col sm:flex-row justify-between items-start sm:items-center bg-slate-900 p-6 rounded-2xl border border-slate-800 shadow-lg gap-4">
+<div>
+<h2 className="text-xl font-bold text-white flex items-center gap-2">
+<i className="fa-solid fa-right-left text-cyan-400"></i> Histórico & Trilha de Auditoria
+</h2>
+<p className="text-xs text-slate-400 mt-1">Registro completo de movimentações, cadastros, alterações e não conformidades.</p>
+</div>
+<button onClick={exportCSV} className="px-4 py-2 bg-slate-800 text-cyan-300 rounded-xl text-xs font-bold border border-slate-700 hover:bg-slate-700">
+<i className="fa-solid fa-download mr-1"></i> Baixar Relatório CSV
+</button>
+</div>
+<div className="bg-slate-900/90 p-5 rounded-2xl border border-slate-800 space-y-4 shadow-md text-xs">
+<div className="flex items-center justify-between pb-2 border-b border-slate-800">
+<span className="font-extrabold text-cyan-400 uppercase flex items-center gap-2">
+<i className="fa-solid fa-filter"></i> Filtros do Histórico
+</span>
+<button
+onClick={() => {
+setHistorySearch('');
+setHistoryTypeFilter('ALL');
+setHistoryDateStart('');
+setHistoryDateEnd('');
+}}
+className="text-slate-400 hover:text-cyan-300 underline"
+>
+Limpar Filtros
+</button>
+</div>
+<div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+<div>
+<label className="block text-slate-400 font-bold mb-1">Pesquisar por Nome, Operador ou Tag:</label>
+<input
+type="text"
+placeholder="Pesquisar..."
+value={historySearch}
+onChange={(e) => setHistorySearch(e.target.value)}
+className="w-full p-2.5 bg-slate-800 border border-slate-700 rounded-xl text-white font-medium"
+/>
+</div>
+<div>
+<label className="block text-slate-400 font-bold mb-1">Tipo de Movimentação:</label>
+<select
+value={historyTypeFilter}
+onChange={(e) => setHistoryTypeFilter(e.target.value)}
+className="w-full p-2.5 bg-slate-800 border border-slate-700 rounded-xl text-white font-semibold"
+>
+<option value="ALL">Todos os Tipos</option>
+<option value="ENTRADA">ENTRADA</option>
+<option value="SAÍDA">SAÍDA</option>
+<option value="EDIÇÃO">EDIÇÃO</option>
+<option value="EXCLUSÃO ADM">EXCLUSÃO ADM</option>
+<option value="NÃO CONFORMIDADE">NÃO CONFORMIDADE</option>
+</select>
+</div>
+<div>
+<label className="block text-slate-400 font-bold mb-1">Data Inicial:</label>
+<input
+type="date"
+value={historyDateStart}
+onChange={(e) => setHistoryDateStart(e.target.value)}
+className="w-full p-2.5 bg-slate-800 border border-slate-700 rounded-xl text-white"
+/>
+</div>
+<div>
+<label className="block text-slate-400 font-bold mb-1">Data Final:</label>
+<input
+type="date"
+value={historyDateEnd}
+onChange={(e) => setHistoryDateEnd(e.target.value)}
+className="w-full p-2.5 bg-slate-800 border border-slate-700 rounded-xl text-white"
+/>
+</div>
+</div>
+<div className="text-right text-slate-400 pt-1">
+Exibindo <strong>{filteredHistory.length}</strong> de <strong>{historyLogs.length}</strong> registros
+</div>
+</div>
+<div className="bg-slate-900 rounded-2xl border border-slate-800 overflow-hidden shadow-lg">
+{filteredHistory.length === 0 ? (
+<div className="p-8 text-center text-slate-500 text-xs">Nenhum registro localizado no histórico.</div>
+) : (
+<div className="overflow-x-auto">
+<table className="w-full text-left text-xs">
+<thead>
+<tr className="bg-slate-950 border-b border-slate-800 text-slate-400 font-extrabold uppercase">
+<th className="p-4">Data/Hora</th>
+<th className="p-4">Tipo</th>
+<th className="p-4">Equipamento / Insumo</th>
+<th className="p-4">Código Tag</th>
+<th className="p-4 text-center">Quantidade</th>
+<th className="p-4">Setor</th>
+<th className="p-4">Operador</th>
+<th className="p-4">Detalhes</th>
+</tr>
+</thead>
+<tbody className="divide-y divide-slate-800 font-medium">
+{filteredHistory.map(log => (
+<tr key={log.id} className="hover:bg-slate-800/50 transition">
+<td className="p-4 font-mono-code text-slate-400">{formatDateTime(log.timestamp)}</td>
+<td className="p-4">
+{log.type === 'ENTRADA' && <span className="px-2.5 py-1 bg-emerald-950 text-emerald-300 border border-emerald-800 rounded-md font-bold">ENTRADA</span>}
+{log.type === 'SAÍDA' && <span className="px-2.5 py-1 bg-amber-950 text-amber-300 border border-amber-800 rounded-md font-bold">SAÍDA</span>}
+{log.type === 'EDIÇÃO' && <span className="px-2.5 py-1 bg-cyan-950 text-cyan-300 border border-cyan-800 rounded-md font-bold">EDIÇÃO</span>}
+{log.type === 'EXCLUSÃO ADM' && <span className="px-2.5 py-1 bg-red-950 text-red-300 border border-red-800 rounded-md font-bold">EXCLUÍDO ADM</span>}
+{log.type === 'NÃO CONFORMIDADE' && <span className="px-2.5 py-1 bg-orange-950 text-orange-300 border border-orange-800 rounded-md font-bold">NÃO CONFORMIDADE</span>}
+</td>
+<td className="p-4 font-bold text-white">{log.productName}</td>
+<td className="p-4 font-mono-code text-cyan-400">{log.labelId}</td>
+<td className="p-4 text-center font-mono-code font-bold">
+{log.type === 'ENTRADA' ? (
+<span className="text-emerald-400">+{log.movementAmount || 0}</span>
+) : log.type === 'SAÍDA' ? (
+<span className="text-amber-400">{log.movementAmount || 0}</span>
+) : (
+<span className="text-slate-500">--</span>
+)}
+</td>
+<td className="p-4 text-slate-300">{log.sector || 'N/I'}</td>
+<td className="p-4 text-slate-300">{log.operator}</td>
+<td className="p-4 text-slate-400">{log.details}</td>
+</tr>
+))}
+</tbody>
+</table>
+</div>
+)}
+</div>
+</div>
+)}
+
+{/* ===================== ABA: Não Conformidade ===================== */}
+{activeTab === 'nonconform' && (
+<div className="space-y-6">
+<div className="bg-slate-900 p-6 rounded-2xl border border-slate-800 shadow-lg">
+<h2 className="text-xl font-extrabold text-white flex items-center gap-2">
+<i className="fa-solid fa-triangle-exclamation text-amber-400"></i> Registro de Não Conformidades
+</h2>
+<p className="text-xs text-slate-400 mt-1">Descreva problemas identificados antes, durante ou depois da armazenagem / uso do item.</p>
+</div>
+
+{/* Formulário de NC */}
+<div className="bg-slate-900 p-6 rounded-2xl border border-slate-800 shadow-lg space-y-4">
+<div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs">
+<div>
+<label className="block font-bold text-slate-300 uppercase mb-1">Item / Equipamento <span className="text-red-400">*</span></label>
+<select
+value={ncItemId}
+onChange={(e) => setNcItemId(e.target.value)}
+className="w-full p-3 bg-slate-800 border border-slate-700 rounded-xl text-white font-semibold"
+>
+<option value="">-- Selecione o item --</option>
+{stockItems.map(item => (
+<option key={item.id} value={item.id}>{item.productName} ({item.serialOrTag || item.id})</option>
+))}
+</select>
+</div>
+<div>
+<label className="block font-bold text-slate-300 uppercase mb-1">Fase da Não Conformidade <span className="text-red-400">*</span></label>
+<select
+value={ncPhase}
+onChange={(e) => setNcPhase(e.target.value)}
+className="w-full p-3 bg-slate-800 border border-slate-700 rounded-xl text-white font-semibold"
+>
+<option value="ANTES">Antes da Armazenagem</option>
+<option value="DURANTE">Durante a Armazenagem</option>
+<option value="DEPOIS">Depois da Armazenagem / Uso</option>
+</select>
+</div>
+</div>
+<div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs">
+<div>
+<label className="block font-bold text-slate-300 uppercase mb-1">Severidade</label>
+<select
+value={ncSeverity}
+onChange={(e) => setNcSeverity(e.target.value)}
+className="w-full p-3 bg-slate-800 border border-slate-700 rounded-xl text-white font-semibold"
+>
+<option value="BAIXA">Baixa</option>
+<option value="MEDIA">Média</option>
+<option value="ALTA">Alta</option>
+<option value="CRITICA">Crítica</option>
+</select>
+</div>
+<div>
+<label className="block font-bold text-slate-300 uppercase mb-1">Operador / Responsável</label>
+<input
+type="text"
+value={ncOperator}
+onChange={(e) => setNcOperator(e.target.value)}
+placeholder={`Padrão: ${adminName}`}
+className="w-full p-3 bg-slate-800 border border-slate-700 rounded-xl text-white font-semibold"
+/>
+</div>
+</div>
+<div>
+<label className="block text-xs font-bold text-slate-300 uppercase mb-1">Descrição da Não Conformidade <span className="text-red-400">*</span></label>
+<textarea
+rows="3"
+value={ncDescription}
+onChange={(e) => setNcDescription(e.target.value)}
+placeholder="Descreva o problema encontrado (ex: embalagem danificada, vazamento, validade comprometida, sensor descalibrado...)"
+className="w-full p-3 bg-slate-800 border border-slate-700 rounded-xl text-xs text-white focus:ring-2 focus:ring-cyan-500"
+></textarea>
+</div>
+<button
+onClick={handleAddNonConformity}
+className="w-full sm:w-auto px-6 py-3 bg-amber-500 text-slate-950 font-black rounded-xl text-xs hover:bg-amber-400 flex items-center justify-center gap-2"
+>
+<i className="fa-solid fa-plus"></i> Registrar Não Conformidade
+</button>
+</div>
+
+{/* Lista de NCs */}
+<div className="bg-slate-900/90 p-5 rounded-2xl border border-slate-800 space-y-4 shadow-md text-xs">
+<div className="flex items-center justify-between pb-2 border-b border-slate-800">
+<span className="font-extrabold text-cyan-400 uppercase flex items-center gap-2">
+<i className="fa-solid fa-list"></i> Registros de Não Conformidade ({filteredNc.length})
+</span>
+</div>
+<div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+<input
+type="text"
+placeholder="Buscar por item ou descrição..."
+value={ncSearch}
+onChange={(e) => setNcSearch(e.target.value)}
+className="w-full p-2.5 bg-slate-800 border border-slate-700 rounded-xl text-white font-medium"
+/>
+<select
+value={ncPhaseFilter}
+onChange={(e) => setNcPhaseFilter(e.target.value)}
+className="w-full p-2.5 bg-slate-800 border border-slate-700 rounded-xl text-white font-semibold"
+>
+<option value="ALL">Todas as Fases</option>
+<option value="ANTES">Antes da Armazenagem</option>
+<option value="DURANTE">Durante a Armazenagem</option>
+<option value="DEPOIS">Depois da Armazenagem</option>
+</select>
+</div>
+</div>
+
+{filteredNc.length === 0 ? (
+<div className="bg-slate-900 rounded-2xl p-8 text-center border border-slate-800 text-slate-500 text-xs">
+Nenhuma não conformidade registrada ainda.
+</div>
+) : (
+<div className="space-y-3">
+{filteredNc.map(nc => (
+<div key={nc.id} className="bg-slate-900 rounded-2xl border border-slate-800 p-5 shadow-md">
+<div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+<div className="flex items-center gap-2">
+<span className={`px-2.5 py-1 rounded-md text-[10px] font-black uppercase ${
+nc.phase === 'ANTES' ? 'bg-blue-950 text-blue-300 border border-blue-800' :
+nc.phase === 'DURANTE' ? 'bg-amber-950 text-amber-300 border border-amber-800' :
+'bg-red-950 text-red-300 border border-red-800'
+}`}>
+{nc.phase === 'ANTES' ? 'Antes' : nc.phase === 'DURANTE' ? 'Durante' : 'Depois'}
+</span>
+<span className={`px-2.5 py-1 rounded-md text-[10px] font-black uppercase ${
+nc.severity === 'CRITICA' ? 'bg-red-600 text-white' :
+nc.severity === 'ALTA' ? 'bg-orange-600 text-white' :
+nc.severity === 'MEDIA' ? 'bg-amber-600 text-slate-950' :
+'bg-slate-600 text-white'
+}`}>
+{nc.severity}
+</span>
+</div>
+<span className="text-[10px] font-mono-code text-slate-500">{formatDateTime(nc.timestamp)}</span>
+</div>
+<h4 className="font-extrabold text-white text-sm">{nc.productName}</h4>
+<p className="text-xs text-slate-400 mt-0.5">TAG: {nc.serialOrTag} | Setor: {nc.sector}</p>
+<p className="text-xs text-slate-200 mt-2 bg-slate-950/80 p-3 rounded-xl border border-slate-800">{nc.description}</p>
+<p className="text-[10px] text-slate-500 mt-2">Registrado por: <strong className="text-slate-300">{nc.operator}</strong></p>
+</div>
+))}
+</div>
+)}
+</div>
+)}
+
+{/* ===================== ABA: Admin ===================== */}
+{activeTab === 'admin' && (
+<div className="max-w-4xl mx-auto space-y-8">
+<div className="bg-slate-900 p-6 sm:p-8 rounded-2xl border border-slate-800 shadow-lg space-y-6">
+<div className="flex items-center justify-between border-b border-slate-800 pb-4">
+<div>
+<h2 className="text-xl font-extrabold text-white flex items-center gap-2">
+<i className="fa-solid fa-sliders text-cyan-400"></i> Painel da Administradora Principal
+</h2>
+<p className="text-xs text-slate-400 mt-1">Configure o controle da empresa, setores, categorias e backups.</p>
+</div>
+<span className="px-3 py-1 bg-cyan-950 text-cyan-300 border border-cyan-800 text-xs font-bold rounded-xl">
+Acesso Administradora
+</span>
+</div>
+<div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+<div>
+<label className="block text-xs font-bold text-slate-300 uppercase mb-2">Nome da Empresa / Projeto:</label>
+<input
+type="text"
+value={companyName}
+onChange={(e) => setCompanyName(e.target.value)}
+className="w-full p-3 bg-slate-800 border border-slate-700 rounded-xl text-xs font-bold text-white"
+/>
+</div>
+<div>
+<label className="block text-xs font-bold text-slate-300 uppercase mb-2">Administradora Responsável:</label>
+<input
+type="text"
+value={adminName}
+onChange={(e) => setAdminName(e.target.value)}
+className="w-full p-3 bg-slate-800 border border-slate-700 rounded-xl text-xs font-bold text-white"
+/>
+</div>
+</div>
+</div>
+
+<div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+<div className="bg-slate-900 p-6 rounded-2xl border border-slate-800 space-y-4">
+<h3 className="text-sm font-bold text-white uppercase flex items-center gap-2">
+<i className="fa-solid fa-list text-cyan-400"></i> Categorias Customizadas
+</h3>
+<p className="text-xs text-slate-400">Adicione categorias para organização dos insumos.</p>
+<CategoryAddForm onAdd={(newCat) => {
+if (!categories.includes(newCat)) setCategories([...categories, newCat]);
+}} />
+<div className="space-y-2 mt-4 max-h-48 overflow-y-auto">
+{categories.length === 0 ? (
+<p className="text-xs text-slate-500 italic">Nenhuma categoria cadastrada.</p>
+) : (
+categories.map((cat, idx) => (
+<div key={idx} className="flex justify-between items-center bg-slate-800 px-3 py-2 rounded-xl text-xs">
+<span className="font-semibold text-white">{cat}</span>
+<button
+onClick={() => setCategories(categories.filter((_, i) => i !== idx))}
+className="text-slate-400 hover:text-red-400"
+>
+<i className="fa-solid fa-trash-can"></i>
+</button>
+</div>
+))
+)}
+</div>
+</div>
+<div className="bg-slate-900 p-6 rounded-2xl border border-slate-800 space-y-4">
+<h3 className="text-sm font-bold text-white uppercase flex items-center gap-2">
+<i className="fa-solid fa-industry text-cyan-400"></i> Setores / Estações
+</h3>
+<p className="text-xs text-slate-400">Adicione os tanques, reatores ou áreas da planta.</p>
+<CategoryAddForm placeholder="Ex: Tanque ETE 02, Filtro Prensa..." onAdd={(newSec) => {
+if (!sectors.includes(newSec)) setSectors([...sectors, newSec]);
+}} />
+<div className="space-y-2 mt-4 max-h-48 overflow-y-auto">
+{sectors.length === 0 ? (
+<p className="text-xs text-slate-500 italic">Nenhum setor cadastrado.</p>
+) : (
+sectors.map((sec, idx) => (
+<div key={idx} className="flex justify-between items-center bg-slate-800 px-3 py-2 rounded-xl text-xs">
+<span className="font-semibold text-white">{sec}</span>
+<button
+onClick={() => setSectors(sectors.filter((_, i) => i !== idx))}
+className="text-slate-400 hover:text-red-400"
+>
+<i className="fa-solid fa-trash-can"></i>
+</button>
+</div>
+))
+)}
+</div>
+</div>
+</div>
+
+<div className="bg-slate-900 p-6 rounded-2xl border border-slate-800 space-y-6">
+<h3 className="text-sm font-bold text-white uppercase flex items-center gap-2">
+<i className="fa-solid fa-database text-cyan-400"></i> Gestão de Dados e Backup
+</h3>
+<p className="text-xs text-slate-400 -mt-2 mb-2">
+Dados persistidos em <strong className="text-cyan-400">SQLite</strong> (sql.js) + IndexedDB no navegador. Backup JSON continua disponível para exportação/importação.
+</p>
+<div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+<button
+onClick={exportBackupJSON}
+className="p-4 bg-slate-800 border border-slate-700 hover:bg-slate-700/80 rounded-xl text-xs font-bold text-cyan-300 flex items-center justify-center gap-2"
+>
+<i className="fa-solid fa-file-export text-lg"></i> Exportar Backup Completo (JSON)
+</button>
+<label className="p-4 bg-slate-800 border border-slate-700 hover:bg-slate-700/80 rounded-xl text-xs font-bold text-cyan-300 flex items-center justify-center gap-2 cursor-pointer">
+<i className="fa-solid fa-file-import text-lg"></i> Importar Backup (JSON)
+<input type="file" accept=".json" onChange={importBackupJSON} className="hidden" />
+</label>
+</div>
+<div className="pt-4 border-t border-slate-800 flex justify-between items-center">
+<div>
+<h4 className="text-xs font-bold text-red-400">Reset Total do Sistema</h4>
+<p className="text-[11px] text-slate-500">Limpar totalmente a base local e reiniciar com sistema limpo.</p>
+</div>
+<button
+onClick={() => setConfirmResetModal(true)}
+className="px-4 py-2.5 bg-red-950/80 text-red-300 border border-red-800 hover:bg-red-900 rounded-xl text-xs font-bold"
+>
+Zerar Banco de Dados
+</button>
+</div>
+</div>
+</div>
+)}
+
+{/* Modal de Confirmação de Reset Total */}
+{confirmResetModal && (
+<div className="fixed inset-0 bg-slate-950/90 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+<div className="bg-slate-900 border border-red-700 rounded-2xl max-w-md w-full p-6 shadow-2xl">
+<h3 className="text-lg font-bold text-red-400 flex items-center gap-2">
+<i className="fa-solid fa-triangle-exclamation"></i> Confirmar Limpeza Total
+</h3>
+<p className="text-xs text-slate-300 mt-2">
+Esta ação apagará todos os ativos, histórico e não conformidades locais.
+</p>
+<div className="mt-6 flex justify-end gap-3">
+<button
+onClick={() => setConfirmResetModal(false)}
+className="px-4 py-2 bg-slate-800 text-slate-300 rounded-xl text-xs font-bold"
+>
+Cancelar
+</button>
+<button
+onClick={async () => {
+sqliteClearAll();
+try {
+  // limpa também IndexedDB e residual localStorage
+  const idb = await idbOpen();
+  const tx = idb.transaction(IDB_STORE, 'readwrite');
+  tx.objectStore(IDB_STORE).delete(IDB_KEY);
+  ['poptime_ind_categories','poptime_ind_sectors','poptime_ind_stock','poptime_ind_history','poptime_ind_nonconform','poptime_ind_admin_name','poptime_ind_company_name'].forEach(k => localStorage.removeItem(k));
+} catch(_) {}
+window.location.reload();
+}}
+className="px-5 py-2 bg-red-600 text-white font-extrabold rounded-xl text-xs hover:bg-red-500"
+>
+Sim, Limpar Tudo
+</button>
+</div>
+</div>
+</div>
+)}
+</main>
+
+{/* Área oculta para impressão em estampa/impressora térmica */}
+<div id="printable-label-area" className="hidden print:block">
+{printBatchItems.map((item, idx) => (
+<div key={item.id || idx} className="page-break">
+<IndustrialLabelCard
+productName={item.productName}
+category={item.category}
+sector={item.sector}
+serialOrTag={item.serialOrTag}
+creationDate={item.creationDate}
+validityDate={item.validityDate}
+operator={item.operator}
+batchNumber={item.batchNumber}
+technicalNotes={item.technicalNotes}
+labelId={item.id}
+companyName={companyName}
+isPrintOnly={true}
+/>
+</div>
+))}
+</div>
+</div>
+);
+}
+
+function CategoryAddForm({ placeholder = "Digite para adicionar...", onAdd }) {
+const [val, setVal] = useState('');
+const handleSubmit = (e) => {
+e.preventDefault();
+if (val.trim()) {
+onAdd(val.trim());
+setVal('');
+}
+};
+return (
+<form onSubmit={handleSubmit} className="flex gap-2">
+<input
+type="text"
+placeholder={placeholder}
+value={val}
+onChange={(e) => setVal(e.target.value)}
+className="flex-1 p-2.5 bg-slate-800 border border-slate-700 rounded-xl text-xs text-white"
+/>
+<button type="submit" className="px-4 py-2.5 bg-cyan-500 text-slate-950 font-bold rounded-xl text-xs hover:bg-cyan-400">
+Adicionar
+</button>
+</form>
+);
+}
+
+function IndustrialLabelCard({ productName, category, sector, serialOrTag, creationDate, validityDate, operator, batchNumber, technicalNotes, labelId, companyName, isPrintOnly = false }) {
+const qrUrl = getQrCodeUrl(labelId || `${productName}-${validityDate}`);
+return (
+<div className={`bg-white border-2 border-slate-900 rounded-xl p-4 text-slate-900 max-w-sm mx-auto shadow-xl ${isPrintOnly ? 'w-[65mm] h-[45mm] p-2 border-black border text-[10px]' : ''}`}>
+<div className="border-b-2 border-slate-900 pb-1 mb-2 flex justify-between items-center">
+<div>
+<span className="text-[8px] font-black tracking-widest text-slate-600 uppercase block leading-none">
+{companyName || 'CONTROLE INDUSTRIAL'}
+</span>
+<h4 className="font-black text-sm uppercase tracking-tight text-slate-950 leading-tight mt-0.5">
+{productName}
+</h4>
+</div>
+<span className="text-[8px] font-mono-code font-bold bg-slate-200 px-1.5 py-0.5 rounded text-slate-800 border border-slate-400">
+{category}
+</span>
+</div>
+<div className="flex items-center justify-between gap-2">
+<div className="flex-1 space-y-1 text-xs">
+<div>
+<span className="text-[8px] font-bold text-slate-500 uppercase block">Setor / Local:</span>
+<strong className="text-slate-900">{sector}</strong>
+</div>
+<div>
+<span className="text-[8px] font-bold text-slate-500 uppercase block">Entrada:</span>
+<strong className="font-mono-code text-slate-900">{formatDateTime(creationDate)}</strong>
+</div>
+<div>
+<span className="text-[8px] font-black text-cyan-800 uppercase block">Data Limite / Verificação:</span>
+<strong className="font-mono-code text-slate-950 font-black text-sm block">
+{formatDateTime(validityDate)}
+</strong>
+</div>
+<div className="pt-1 text-[9px] text-slate-700 flex justify-between border-t border-slate-300">
+<span>TAG: <strong>{serialOrTag}</strong></span>
+<span>Lote: <strong>{batchNumber}</strong></span>
+</div>
+</div>
+<div className="flex flex-col items-center justify-center pl-2 border-l border-slate-300">
+<img src={qrUrl} alt="QR Tag" className="w-16 h-16 object-contain" />
+<span className="text-[8px] font-mono-code text-slate-700 mt-0.5">{labelId}</span>
+</div>
+</div>
+{technicalNotes && (
+<div className="mt-1.5 text-[8px] text-slate-600 border-t border-slate-300 pt-0.5 italic">
+Obs: {technicalNotes}
+</div>
+)}
+</div>
+);
+}
+
+function IndustrialQrScannerComponent({ onScanSuccess }) {
+  const [isCameraActive, setIsCameraActive] = useState(false);
+  const [cameraError, setCameraError] = useState(null);
+  const [isStarting, setIsStarting] = useState(false);
+  const [permissionState, setPermissionState] = useState('unknown'); // granted | denied | prompt | unknown
+  const videoRef = useRef(null);
+  const canvasRef = useRef(null);
+  const streamRef = useRef(null);
+  const rafRef = useRef(null);
+  const lastScanRef = useRef('');
+  const lastScanTimeRef = useRef(0);
+  const runningRef = useRef(false);
+  const barcodeDetectorRef = useRef(null);
+
+  const stopTracks = () => {
+    if (streamRef.current) {
+      try {
+        streamRef.current.getTracks().forEach(t => {
+          try { t.stop(); } catch (_) {}
+        });
+      } catch (_) {}
+      streamRef.current = null;
+    }
+    if (videoRef.current) {
+      try { videoRef.current.srcObject = null; } catch (_) {}
+    }
+  };
+
+  const stopCamera = React.useCallback(() => {
+    runningRef.current = false;
+    if (rafRef.current) {
+      cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
+    }
+    stopTracks();
+    setIsCameraActive(false);
+    setIsStarting(false);
+  }, []);
+
+  useEffect(() => {
+    return () => { stopCamera(); };
+  }, [stopCamera]);
+
+  // Consulta status de permissão (Chrome/Android) sem bloquear
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        if (navigator.permissions && navigator.permissions.query) {
+          const status = await navigator.permissions.query({ name: 'camera' });
+          if (!cancelled) setPermissionState(status.state || 'unknown');
+          status.onchange = () => {
+            if (!cancelled) setPermissionState(status.state || 'unknown');
+          };
+        }
+      } catch (_) {
+        // Safari e alguns browsers não suportam permissions.query('camera')
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  const handleDecoded = (text) => {
+    if (!text || !runningRef.current) return;
+    const now = Date.now();
+    if (text === lastScanRef.current && (now - lastScanTimeRef.current) < 2000) return;
+    lastScanRef.current = text;
+    lastScanTimeRef.current = now;
+    runningRef.current = false;
+    onScanSuccess(text);
+    stopCamera();
+  };
+
+  const scanFrame = () => {
+    if (!runningRef.current) return;
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    if (!video || !canvas || video.readyState < 2) {
+      rafRef.current = requestAnimationFrame(scanFrame);
+      return;
+    }
+    const w = video.videoWidth;
+    const h = video.videoHeight;
+    if (!w || !h) {
+      rafRef.current = requestAnimationFrame(scanFrame);
+      return;
+    }
+    // limita resolução do canvas para performance em mobile
+    const maxSide = 480;
+    const scale = Math.min(1, maxSide / Math.max(w, h));
+    const cw = Math.floor(w * scale);
+    const ch = Math.floor(h * scale);
+    if (canvas.width !== cw) canvas.width = cw;
+    if (canvas.height !== ch) canvas.height = ch;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(video, 0, 0, cw, ch);
+
+    const finishLoop = () => {
+      if (runningRef.current) rafRef.current = requestAnimationFrame(scanFrame);
+    };
+
+    // 1) BarcodeDetector nativo (Chrome Android / alguns Chromium)
+    if (barcodeDetectorRef.current) {
+      barcodeDetectorRef.current.detect(canvas).then(codes => {
+        if (codes && codes.length) {
+          const raw = codes[0].rawValue || codes[0].data || '';
+          if (raw) {
+            handleDecoded(String(raw));
+            return;
+          }
+        }
+        // 2) jsQR fallback no mesmo frame
+        tryDecodeJsQR(ctx, cw, ch);
+        finishLoop();
+      }).catch(() => {
+        tryDecodeJsQR(ctx, cw, ch);
+        finishLoop();
+      });
+      return;
+    }
+
+    tryDecodeJsQR(ctx, cw, ch);
+    finishLoop();
+  };
+
+  const tryDecodeJsQR = (ctx, cw, ch) => {
+    if (typeof jsQR === 'undefined') return;
+    try {
+      const imageData = ctx.getImageData(0, 0, cw, ch);
+      const code = jsQR(imageData.data, imageData.width, imageData.height, {
+        inversionAttempts: 'attemptBoth'
+      });
+      if (code && code.data) handleDecoded(code.data);
+    } catch (_) {}
+  };
+
+  const getRearStream = async () => {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      const err = new Error('mediaDevices_unavailable');
+      err.name = 'NotSupportedError';
+      throw err;
+    }
+
+    // Lista de constraints — só traseira. Do mais específico ao mais permissivo.
+    const constraintList = [
+      { audio: false, video: { facingMode: { exact: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } } },
+      { audio: false, video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } } },
+      { audio: false, video: { facingMode: { exact: 'environment' } } },
+      { audio: false, video: { facingMode: 'environment' } },
+    ];
+
+    // Tenta deviceId de câmeras traseiras se enumerateDevices estiver disponível
+    try {
+      // precisa de permissão prévia para labels; se já tiver, filtra
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const videos = devices.filter(d => d.kind === 'videoinput');
+      const rear = videos.filter(d => {
+        const l = (d.label || '').toLowerCase();
+        if (!l) return false;
+        if (/front|user|selfie|facetime|frontal|dianteira/.test(l)) return false;
+        return /back|rear|traseira|environment|posterior|world|facing back/.test(l);
+      });
+      rear.forEach(d => {
+        constraintList.push({ audio: false, video: { deviceId: { exact: d.deviceId } } });
+        constraintList.push({ audio: false, video: { deviceId: d.deviceId } });
+      });
+      // mobile multi-câmera sem label: tenta a última
+      if (!rear.length && videos.length > 1) {
+        const last = videos[videos.length - 1];
+        if (last.deviceId) {
+          constraintList.push({ audio: false, video: { deviceId: { exact: last.deviceId } } });
+        }
+      }
+    } catch (_) {}
+
+    let lastErr = null;
+    for (const constraints of constraintList) {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia(constraints);
+        return stream;
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+    throw lastErr || new Error('camera_open_failed');
+  };
+
+  const startCamera = async () => {
+    if (runningRef.current || isStarting) return;
+
+    setCameraError(null);
+    setIsStarting(true);
+
+    const proto = (location && location.protocol) || '';
+    if (proto === 'content:' || proto === 'file:' || !window.isSecureContext) {
+      const host = (location && location.hostname) || '';
+      const isLan = /^\d+\.\d+\.\d+\.\d+$/.test(host);
+      let msg;
+      if (proto === 'content:') {
+        msg = 'Você abriu o app por content:// (arquivo local no Android). Nesse modo o navegador bloqueia a câmera por segurança. Publique o HTML em um site HTTPS (ex.: Netlify, GitHub Pages, Vercel) e abra pelo link https://…';
+      } else if (proto === 'file:') {
+        msg = 'Você abriu o arquivo HTML direto do celular (file://). A câmera não funciona assim. Hospede em HTTPS e abra pelo link https://…';
+      } else if (isLan) {
+        msg = 'Endereço HTTP por IP local: a câmera fica bloqueada. Use HTTPS ou localhost.';
+      } else {
+        msg = 'Abra este app em HTTPS ou localhost. A câmera não funciona em content://, file:// ou http:// comum.';
+      }
+      setCameraError(msg);
+      setIsStarting(false);
+      return;
+    }
+
+    try {
+      // Para qualquer stream antigo
+      stopTracks();
+
+      const stream = await getRearStream();
+      streamRef.current = stream;
+      setPermissionState('granted');
+
+      setIsCameraActive(true);
+      setIsStarting(false);
+
+      // espera o video montar no DOM
+      await new Promise(r => setTimeout(r, 100));
+
+      const video = videoRef.current;
+      if (!video) {
+        throw new Error('video_element_missing');
+      }
+
+      video.setAttribute('playsinline', 'true');
+      video.setAttribute('autoplay', 'true');
+      video.muted = true;
+      video.srcObject = stream;
+
+      await new Promise((resolve, reject) => {
+        const t = setTimeout(() => reject(new Error('video_timeout')), 8000);
+        video.onloadedmetadata = () => {
+          clearTimeout(t);
+          video.play().then(resolve).catch(reject);
+        };
+      });
+
+      // BarcodeDetector se existir
+      try {
+        if (typeof BarcodeDetector !== 'undefined') {
+          const formats = ['qr_code'];
+          barcodeDetectorRef.current = new BarcodeDetector({ formats });
+        }
+      } catch (_) {
+        barcodeDetectorRef.current = null;
+      }
+
+      runningRef.current = true;
+      rafRef.current = requestAnimationFrame(scanFrame);
+    } catch (err) {
+      console.error('[QR] startCamera:', err);
+      stopTracks();
+      setIsCameraActive(false);
+      setIsStarting(false);
+      runningRef.current = false;
+
+      const name = err && err.name ? err.name : '';
+      const msg = String(err && (err.message || err));
+
+      if (name === 'NotAllowedError' || name === 'PermissionDeniedError' || /NotAllowed|Permission|denied/i.test(msg)) {
+        setPermissionState('denied');
+        setCameraError(
+          'Permissão de câmera bloqueada neste navegador. ' +
+          'Vá em Configurações do site → Câmera → Permitir, depois toque em Tentar novamente. ' +
+          'No Android (Chrome): ícone de cadeado/info na barra de endereço → Permissões → Câmera → Permitir. ' +
+          'No iPhone (Safari): Ajustes → Safari → Câmera → Permitir.'
+        );
+      } else if (name === 'NotFoundError' || name === 'DevicesNotFoundError') {
+        setCameraError('Nenhuma câmera traseira foi encontrada neste aparelho.');
+      } else if (name === 'NotReadableError' || name === 'TrackStartError' || name === 'AbortError') {
+        setCameraError('A câmera está em uso por outro aplicativo. Feche a câmera nativa, WhatsApp e similares, aguarde 3 segundos e tente de novo.');
+      } else if (name === 'OverconstrainedError' || name === 'ConstraintNotSatisfiedError') {
+        setCameraError('Não foi possível selecionar a câmera traseira. Toque em Tentar novamente.');
+      } else if (name === 'NotSupportedError' || /mediaDevices_unavailable/i.test(msg)) {
+        setCameraError('Este navegador não oferece acesso à câmera. Use Chrome, Safari ou Edge atualizado.');
+      } else if (!window.isSecureContext) {
+        setCameraError('Contexto inseguro. Use HTTPS ou localhost.');
+      } else {
+        setCameraError('Não foi possível abrir a câmera traseira. Toque em Tentar novamente. (' + (name || msg).toString().substring(0, 80) + ')');
+      }
+    }
+  };
+
+  return (
+    <div className="space-y-3">
+      {cameraError && (
+        <div className="bg-red-950/80 border border-red-700 text-red-200 text-xs rounded-xl p-3 flex items-start gap-2">
+          <i className="fa-solid fa-circle-exclamation mt-0.5 shrink-0"></i>
+          <div className="flex-1">
+            <p className="font-bold">Problema com a câmera</p>
+            <p className="mt-1 text-red-300/90 leading-relaxed">{cameraError}</p>
+            <button
+              type="button"
+              onClick={() => { setCameraError(null); startCamera(); }}
+              className="mt-2 text-cyan-400 font-bold underline"
+            >
+              Tentar novamente
+            </button>
+          </div>
+        </div>
+      )}
+
+      {!isCameraActive ? (
+        <div className="space-y-2">
+          <button
+            type="button"
+            onClick={startCamera}
+            disabled={isStarting}
+            className="w-full py-4 bg-cyan-500 text-slate-950 font-black rounded-xl text-xs hover:bg-cyan-400 flex items-center justify-center gap-2 shadow-lg shadow-cyan-500/20 disabled:opacity-60"
+          >
+            {isStarting ? (
+              <><i className="fa-solid fa-spinner fa-spin"></i> Abrindo câmera traseira...</>
+            ) : (
+              <><i className="fa-solid fa-camera"></i> Ativar Câmera Traseira</>
+            )}
+          </button>
+          {permissionState === 'denied' && !cameraError && (
+            <p className="text-[10px] text-amber-400 text-center">
+              Permissão de câmera está bloqueada nas configurações do navegador.
+            </p>
+          )}
+        </div>
+      ) : (
+        <div className="space-y-2">
+          <div className="relative rounded-xl overflow-hidden border border-cyan-500/50 bg-slate-950 min-h-[280px] flex items-center justify-center">
+            <video
+              ref={videoRef}
+              playsInline
+              muted
+              autoPlay
+              className="w-full max-h-[360px] object-cover rounded-xl"
+              style={{ transform: 'scaleX(1)' }}
+            />
+            <canvas ref={canvasRef} className="hidden" />
+            <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
+              <div className="w-[70%] max-w-[240px] aspect-square border-2 border-cyan-400/80 rounded-xl shadow-[0_0_0_9999px_rgba(2,6,23,0.45)]" />
+            </div>
+          </div>
+          <p className="text-[10px] text-slate-500 text-center">
+            Aponte a câmera traseira para o QR da etiqueta. A leitura para automaticamente.
+          </p>
+          <button
+            type="button"
+            onClick={stopCamera}
+            className="w-full py-2.5 bg-slate-800 text-slate-300 font-bold rounded-xl text-xs hover:bg-slate-700 border border-slate-700"
+          >
+            Parar Câmera
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+const rootElement = document.getElementById('root');
+if (rootElement) {
+const root = ReactDOM.createRoot(rootElement);
+root.render(<App />);
+}
+</script>
+</body>
+</html>
